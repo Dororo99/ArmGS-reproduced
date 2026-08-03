@@ -1,0 +1,59 @@
+# Values explicitly reported by the paper are marked `paper`.
+# The remaining architecture dimensions are reproducibility assumptions.
+model:
+  frame_embedding_dim: 16
+  sh_degree: 3
+  local:
+    hidden_dim: 64
+    num_layers: 3              # paper
+    scale_delta_limit: 1.0       # assumption: local scale remains in (0, 2)
+    bias_limit: 0.5              # assumption
+    hash_grid:
+      num_levels: 8
+      features_per_level: 2
+      log2_hashmap_size: 15
+      base_resolution: 16
+      max_resolution: 2048
+      chunk_size: 65536          # reference-backend memory bound
+  global:
+    hidden_dim: 64
+    num_layers: 4              # paper
+    position_frequencies: 6
+    direction_frequencies: 4
+    matrix_delta_limit: 0.5      # assumption: identity-centered element bound
+    bias_limit: 0.5              # assumption
+  actor:
+    hidden_dim: 64
+    encoder_layers: 2          # paper
+    head_layers: 2             # paper
+    position_frequencies: 6
+    time_frequencies: 6
+
+optimization:
+  iterations: 30000            # paper
+  learning_rates:
+    mean_initial: 0.00016       # paper
+    mean_final: 0.0000016       # paper
+    rotation: 0.001             # paper
+    scale: 0.005                # paper
+    opacity: 0.05               # paper
+    sh: 0.0025                  # paper
+    appearance: 0.001
+    actor_deformation: 0.001
+    actor_pose: 0.0001
+    sky: 0.001
+  densification:
+    start_iteration: 500       # paper
+    end_iteration: 15000       # paper
+    interval: 100              # paper
+
+loss:
+  lambda_ssim: 0.2             # paper lambda_1
+  ssim_window_size: 11         # assumption: common 3DGS convention
+  ssim_sigma: 1.5              # assumption
+  ssim_data_range: 1.0         # assumption
+  require_auxiliary: true       # fail rather than silently omit paper losses
+  lambda_depth: 0.01           # paper lambda_2
+  lambda_sky: 0.05             # paper lambda_3
+  lambda_foreground: 0.1       # paper lambda_4
+
