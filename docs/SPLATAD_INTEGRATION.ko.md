@@ -2,8 +2,10 @@
 
 이 문서는 독립 ArmGS vertical slice를 인접 SplatAD/CamoSplat 코드베이스에 연결할 때
 필요한 결정과 삽입 지점을 기록한다. 독립 패키지 안에서는 composite scene, cubemap
-sky, gsplat CUDA 전체 backward와 one-view trainer가 동작한다. 다만 실제
-SplatAD/Nerfstudio model 및 dataparser에는 아직 삽입하지 않았다.
+sky, gsplat CUDA 전체 backward, exact-resume trainer와 density control이 동작한다.
+canonical KITTI loader/batching/split, colored LiDAR/COLMAP 초기화, metric evaluator도
+독립 경로로 제공한다. 다만 실제 SplatAD/Nerfstudio model 및 dataparser에는 아직
+삽입하지 않았다.
 
 ## 통합 전에 고정할 세 가지 결정
 
@@ -80,15 +82,28 @@ timestamp가 가장 가까운 row를 선택한다.
 - per-Gaussian velocity, camera linear/angular velocity, shutter time/direction forwarding
 - Eq. (9) strict auxiliary availability 검증
 - optimizer group, mean LR decay, model/optimizer/RNG checkpoint state
+- stateful sampler를 포함한 exact mid-epoch resume
+- dataset stat/content fingerprint 기반 checkpoint identity
+- packed/unpacked gsplat screen statistics와 duplicate/split/prune/reset
+- topology 변경 시 Adam state migration과 checkpoint restore
+- canonical KITTI loader, projected LiDAR union, leak-free actor-sample split
+- KITTI bottom-center → centered canonical actor pose 변환
+- colored LiDAR/COLMAP background 및 tracked actor-local scene 초기화
+- KITTI training CLI와 uint8-safe PSNR/SSIM/optional LPIPS evaluator CLI
 
-## 아직 필요한 SplatAD/data 연결
+Density schedule(500–15,000 step, interval 100)은 논문값이다. selection threshold,
+split 배율, opacity-reset 값과 semantics는 공개되지 않아 독립 패키지 YAML의 구현
+가정으로 유지하며 clean SplatAD exact parity로 간주하지 않는다.
+
+## 아직 필요한 실제 SplatAD/data 연결
 
 - 실제 SplatAD Gaussian ID를 ArmGS group ID로 변환하는 삽입 코드
-- dataparser sky mask, projected LiDAR depth, actor bbox mask batch field
+- canonical mask/LiDAR/actor 필드를 Nerfstudio dataparser batch field로 연결
 - actor/world velocity와 camera rolling-shutter metadata의 실제 값 생성
-- LiDAR/COLMAP background 초기화 및 tracked-box actor canonical point 구축
-- SplatAD density strategy와 optimizer-state migration
-- dataset split, evaluator 및 training CLI
+- 독립 initializer 결과를 SplatAD Gaussian parameter registry에 이식
+- 기존 SplatAD strategy와 ArmGS density lifecycle 중 하나를 선택해 trainer callback에 연결
+- Waymo/NOTR/VKITTI2 adapter
+- 실제 SplatAD render 결과를 reproduction report/evaluator에 연결
 
 ## 환경 주의사항
 

@@ -94,7 +94,10 @@ class ActorDeformationRefiner(nn.Module):
             (
                 self.position_encoder(means),
                 self.time_encoder(expanded_time),
-                sh_coefficients.reshape(means.shape[0], -1),
+                # Keep the feature width explicit: reshape(0, -1) is
+                # ambiguous after density pruning removes every Gaussian
+                # from an actor.
+                sh_coefficients.reshape(means.shape[0], self.sh_dim),
             ),
             dim=-1,
         )
@@ -115,4 +118,3 @@ class ActorDeformationRefiner(nn.Module):
             delta_means=delta_means,
             delta_sh=delta_sh,
         )
-

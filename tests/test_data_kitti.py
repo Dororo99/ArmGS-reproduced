@@ -9,6 +9,8 @@ import torch
 from armgs.data import (
     CanonicalFrame,
     CanonicalFrameDataset,
+    KittiTracklet,
+    KittiTrackletPose,
     canonicalize_kitti_tracklets,
     load_kitti_manifest,
     parse_kitti_calibration,
@@ -193,12 +195,52 @@ def test_tracklets_become_world_tracks_with_lifecycle(tmp_path: Path) -> None:
     track = tracks[0]
     assert track.class_name == "Car"
     assert torch.allclose(track.dimensions_lwh, torch.tensor([4.2, 1.8, 1.5], dtype=torch.float64))
-    assert torch.allclose(track.samples[0].translation, torch.tensor([1.0, 0.0, 0.0], dtype=torch.float64))
-    assert torch.allclose(track.samples[1].translation, torch.tensor([12.0, 0.0, 0.0], dtype=torch.float64))
+    # KITTI translation is a bottom center; canonical translation is box center.
+    assert torch.allclose(track.samples[0].translation, torch.tensor([1.0, 0.0, 0.75], dtype=torch.float64))
+    assert torch.allclose(track.samples[1].translation, torch.tensor([12.0, 0.0, 0.75], dtype=torch.float64))
     assert tuple(int(value.item()) for value in track.lifecycle_timestamps) == (0, 100_000_000)
     assert torch.allclose(
         track.samples[1].quaternion_wxyz.abs(),
         torch.tensor([2**-0.5, 0.0, 0.0, 2**-0.5], dtype=torch.float64),
+        atol=1.0e-7,
+    )
+
+
+def test_tracklet_bottom_center_offset_follows_rotated_lidar_height_axis(
+    tmp_path: Path,
+) -> None:
+    calibration_path = tmp_path / "calib.txt"
+    _write_calibration(calibration_path)
+    tracklet = KittiTracklet(
+        object_type="Car",
+        dimensions_hwl=torch.tensor([2.0, 1.5, 4.0], dtype=torch.float64),
+        first_frame=0,
+        poses=(
+            KittiTrackletPose(
+                frame_index=0,
+                translation_lidar=torch.tensor([1.0, 2.0, 3.0], dtype=torch.float64),
+                rotation_rpy=torch.tensor(
+                    [torch.pi / 2.0, 0.0, 0.0], dtype=torch.float64
+                ),
+            ),
+        ),
+    )
+
+    track = canonicalize_kitti_tracklets(
+        (tracklet,),
+        torch.tensor([0], dtype=torch.int64),
+        (torch.eye(4, dtype=torch.float64),),
+        parse_kitti_calibration(calibration_path),
+    )[0]
+
+    assert torch.allclose(
+        track.dimensions_lwh,
+        torch.tensor([4.0, 1.5, 2.0], dtype=torch.float64),
+    )
+    # R_x(+pi/2) maps the local +z height offset to Velodyne -y.
+    assert torch.allclose(
+        track.samples[0].translation,
+        torch.tensor([1.0, 1.0, 3.0], dtype=torch.float64),
         atol=1.0e-7,
     )
 
@@ -227,9 +269,24 @@ def test_load_manifest_is_indexable_and_aligns_optional_masks(tmp_path: Path) ->
     assert frame.image_path.name == "000001.png"
     assert frame.sky_mask_path is not None and frame.actor_mask_path is not None
     assert frame.lidar is not None and frame.lidar_projection is not None
+    assert frame.lidar.points.shape == (1, 3)
     assert torch.allclose(frame.lidar.world_points[0], torch.tensor([10.0, 0.0, 2.0]))
     assert len(manifest.actor_tracks) == 1
 
+
+
+def test_manifest_can_retain_complete_raw_lidar_scan(tmp_path: Path) -> None:
+    _make_sequence(tmp_path / "sequence")
+
+    manifest = load_kitti_manifest(
+        tmp_path / "sequence",
+        camera_ids=(2,),
+        retain_unprojected_lidar=True,
+    )
+
+    for frame in manifest:
+        assert frame.lidar is not None
+        assert frame.lidar.points.shape == (3, 3)
 
 def test_missing_and_malformed_inputs_fail_early(tmp_path: Path) -> None:
     with pytest.raises(FileNotFoundError, match="calibration"):

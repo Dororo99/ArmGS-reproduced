@@ -47,39 +47,55 @@
 완료 조건인 RGB/depth/sky/actor alpha의 end-to-end gradient를 synthetic CUDA
 scene에서 확인했다.
 
-## Phase 3 — loss와 trainer (진행 중)
+## Phase 3 — loss와 trainer (완료)
 
 - [x] Eq. (9) weighted objective와 auxiliary input 강제
 - [x] Gaussian parameter별 finite-positive Adam LR group
 - [x] mean exponential LR decay
 - [x] pose/refinement/sky parameter groups
-- [x] one-view trainer
+- [x] one-view trainer와 multi-frame stateful sampling loop
 - [x] model/optimizer/CPU·CUDA RNG checkpoint resume와 GPU 수 변화 안전성
-- [ ] densification/pruning/opacity reset lifecycle
-- [ ] adaptive topology 변경 이후 optimizer state migration
-- [ ] deterministic multi-frame dataloader resume
+- [x] dataset stat/content fingerprint 기반 resume identity 검증
+- [x] packed/unpacked gsplat metadata의 projected gradient/radius 통계 누적
+- [x] duplicate/split/prune/opacity reset lifecycle
+- [x] adaptive topology 변경 이후 Adam state migration
+- [x] topology 변경을 포함한 strict checkpoint resume
+- [x] stateful shuffle sampler의 deterministic mid-epoch resume
+- [x] KITTI training CLI, periodic checkpoint와 resume
 
-논문은 densification 주기만 공개하고 split/prune threshold와 opacity reset 규칙을
-공개하지 않았으므로, 이 부분은 clean SplatAD baseline 전략을 명시적으로 선택한 뒤
-연결한다.
+논문에 공개된 density schedule은 500–15,000 step, interval 100이다. 반면
+duplicate/split/prune threshold, split 배율과 opacity reset 값·동작은 공개되지
+않았다. 현재 값과 reset-to-configured-probability 동작은 YAML에 구현 가정으로 표시하며,
+논문 고유 설정 또는 clean baseline과의 exact parity로 주장하지 않는다.
 
-## Phase 4 — dataset adapters
+## Phase 4 — dataset adapters (부분 완료)
 
-- [ ] canonical camera/frame/actor/LiDAR schema
-- [ ] KITTI + tracklets converter를 첫 end-to-end target으로 구현
+- [x] canonical camera/frame/actor/LiDAR schema
+- [x] KITTI camera/calibration/pose/timestamp/tracklet/Velodyne loader
+- [x] lazy RGB/mask와 sparse projected LiDAR depth training batch
+- [x] 요청 카메라 projected LiDAR union만 보관하는 memory-safe 기본 경로
+- [x] capture/frame 단위 leak-free train/eval split
+- [x] split별 actor pose sample 분리와 eval-only actor의 train scene 제외
+- [x] KITTI bottom-center box를 centered canonical actor pose로 변환
+- [x] training camera/timestamp와 source-row nearest-embedding metadata 검증
+- [x] colored LiDAR Gaussian initialization
+- [x] COLMAP `points3D.txt` parser와 단위 테스트
+- [ ] COLMAP-to-world 정렬, train-view SfM 생성, LiDAR+SfM 병합 및 학습 CLI 연결
+- [x] tracked actor-local point와 background scene 구축
 - [ ] Waymo + StreetGS tracked boxes
 - [ ] NOTR, VKITTI2
-- [ ] COLMAP/LiDAR Gaussian initialization
-- [ ] train/test split 및 nearest embedding metadata 검증
-- [ ] rolling-shutter metadata 보존
+- [ ] 실제 dataparser에서 rolling-shutter velocity/shutter metadata 생산
 
 KITTI를 먼저 선택하는 이유는 데이터·해상도·tracklet 형식이 비교적 작아 전체
 파이프라인 검증 비용이 낮기 때문이다.
 
-## Phase 5 — evaluation/reproduction
+## Phase 5 — evaluation/reproduction (부분 완료)
 
-- [ ] PSNR/SSIM/LPIPS와 actor-mask PSNR
-- [ ] reconstruction / novel-view CLI
+- [x] PSNR/SSIM/optional LPIPS와 actor-mask PSNR
+- [x] `.pt` pair/manifest metric evaluator CLI와 JSON summary
+- [x] uint8 [0,255] → [0,1] 정규화와 비지원 integer dtype 거부
+- [x] nuScenes trainer의 periodic/final held-out novel-view 평가와 eval-only resume
+- [ ] 다른 dataset용 범용 reconstruction / novel-view rendering CLI
 - [ ] ablation flags: no-local, no-global, no-actor, no-depth, no-sky, no-pose-opt
 - [x] reference hash-grid 100k/1M VRAM benchmark
 - [ ] FPS/VRAM/quality benchmark
@@ -87,7 +103,9 @@ KITTI를 먼저 선택하는 이유는 데이터·해상도·tracklet 형식이 
 
 ## 현재 코딩 범위
 
-독립 ArmGS 패키지 안에서는 논문의 composite forward와 one-view training vertical
-slice가 동작한다. 다음 구현 단위는 clean SplatAD/KITTI 데이터 경로를 연결하고
-adaptive density control을 선택·검증하는 것이다. 실제 데이터 converter가 없으므로
-아직 논문 표를 재현할 수 있는 완성된 dataset CLI는 아니다.
+독립 ArmGS 패키지 안에서는 composite forward, KITTI canonical loader/batching,
+scene 초기화, adaptive density control, exact-resume trainer와 metric evaluator가
+연결된다. 다음 구현 단위는 Waymo/NOTR/VKITTI2 adapter, 실제 SplatAD/Nerfstudio
+삽입과 rolling metadata 생산, fused hash-grid/FPS·quality 측정이다. class-wise actor
+ablation과 논문 표 재현은 그 통합 이후 단계이며, 공개되지 않은 density 설정은 계속
+구현 가정으로 분리한다.

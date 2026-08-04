@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Sequence
 
 import torch
 from torch import Tensor
@@ -15,12 +16,22 @@ _SH_C0 = 0.28209479177387814
 
 @dataclass(frozen=True)
 class GaussianInitializationConfig:
-    """Explicit assumptions not specified by the ArmGS paper."""
+    """Point-cloud initialization settings.
+
+    ArmGS follows 3DGS for density control. The reference 3DGS initializer
+    derives each isotropic scale from the mean squared distance to its three
+    nearest neighbours. initial_scale is therefore used only for a degenerate
+    one-point cloud, where no neighbour distance exists.
+    """
 
     sh_degree: int = 3
     initial_opacity: float = 0.1
     initial_scale: float = 0.05
     voxel_size: float | None = None
+    knn_neighbors: int = 3
+    knn_chunk_size: int = 1024
+    knn_backend: str = "auto"
+    minimum_squared_distance: float = 1.0e-7
 
     def __post_init__(self) -> None:
         if not 0 <= self.sh_degree <= 3:
@@ -36,6 +47,26 @@ class GaussianInitializationConfig:
                 raise ValueError("voxel_size must be finite")
             if self.voxel_size <= 0:
                 raise ValueError("voxel_size must be positive")
+        if (
+            isinstance(self.knn_neighbors, bool)
+            or not isinstance(self.knn_neighbors, int)
+            or self.knn_neighbors <= 0
+        ):
+            raise ValueError("knn_neighbors must be a positive integer")
+        if (
+            isinstance(self.knn_chunk_size, bool)
+            or not isinstance(self.knn_chunk_size, int)
+            or self.knn_chunk_size <= 0
+        ):
+            raise ValueError("knn_chunk_size must be a positive integer")
+        if self.knn_backend not in {"auto", "scipy", "torch"}:
+            raise ValueError(
+                "knn_backend must be one of: auto, scipy, torch"
+            )
+        if not torch.isfinite(torch.tensor(self.minimum_squared_distance)):
+            raise ValueError("minimum_squared_distance must be finite")
+        if self.minimum_squared_distance <= 0:
+            raise ValueError("minimum_squared_distance must be positive")
 
 
 def _validated_points_and_colors(
@@ -93,6 +124,212 @@ def voxel_downsample(
     return point_sums / counts, color_sums / counts
 
 
+@torch.no_grad()
+def estimate_knn_isotropic_scales(
+    points: Tensor,
+    *,
+    neighbor_count: int = 3,
+    chunk_size: int = 1024,
+    backend: str = "auto",
+    minimum_squared_distance: float = 1.0e-7,
+    singleton_scale: float | None = None,
+) -> Tensor:
+    """Estimate reference-3DGS isotropic scales with bounded memory.
+
+    For every point, this computes the square root of the mean squared
+    distance to the nearest min(neighbor_count, N - 1) other points. The mean
+    squared distance is clamped to minimum_squared_distance exactly like the
+    official 3DGS initializer before it is square-rooted.
+
+    The auto backend uses SciPy cKDTree for CPU point clouds when available,
+    avoiding quadratic work for production-size inputs. Otherwise, query and
+    reference points are processed in two-dimensional PyTorch chunks. That
+    fallback remains an exact brute-force search, but its temporary storage is
+    O(chunk_size**2) rather than O(N**2).
+
+    The returned tensor contains positive scales with shape [N, 3]. The
+    learnable scene module converts these values to log-scale parameters.
+    """
+
+    if points.ndim != 2 or points.shape[-1] != 3 or points.shape[0] == 0:
+        raise ValueError("points must have non-empty shape [N,3]")
+    if not points.is_floating_point() or not torch.isfinite(points).all():
+        raise ValueError("points must be finite floating point")
+    if (
+        isinstance(neighbor_count, bool)
+        or not isinstance(neighbor_count, int)
+        or neighbor_count <= 0
+    ):
+        raise ValueError("neighbor_count must be a positive integer")
+    if (
+        isinstance(chunk_size, bool)
+        or not isinstance(chunk_size, int)
+        or chunk_size <= 0
+    ):
+        raise ValueError("chunk_size must be a positive integer")
+    if backend not in {"auto", "scipy", "torch"}:
+        raise ValueError("backend must be one of: auto, scipy, torch")
+    minimum_squared_distance_tensor = torch.as_tensor(
+        minimum_squared_distance, device=points.device, dtype=points.dtype
+    )
+    if (
+        not torch.isfinite(minimum_squared_distance_tensor)
+        or minimum_squared_distance_tensor <= 0
+    ):
+        raise ValueError("minimum_squared_distance must be finite and positive")
+
+    point_count = points.shape[0]
+    if point_count == 1:
+        if singleton_scale is None:
+            scale = minimum_squared_distance_tensor.sqrt()
+        else:
+            scale = torch.as_tensor(
+                singleton_scale, device=points.device, dtype=points.dtype
+            )
+            if not torch.isfinite(scale) or scale <= 0:
+                raise ValueError("singleton_scale must be finite and positive")
+        return scale.expand(1, 3).clone()
+
+    effective_neighbors = min(neighbor_count, point_count - 1)
+    use_scipy = backend == "scipy" or (
+        backend == "auto" and points.device.type == "cpu"
+    )
+    if use_scipy:
+        try:
+            from scipy.spatial import cKDTree
+        except ImportError:
+            if backend == "scipy":
+                raise ImportError(
+                    "the scipy kNN backend requires scipy"
+                ) from None
+        else:
+            numpy_points = (
+                points.detach().to(device="cpu", dtype=torch.float64).numpy()
+            )
+            tree = cKDTree(numpy_points)
+            try:
+                distances, _ = tree.query(
+                    numpy_points,
+                    k=effective_neighbors + 1,
+                    workers=-1,
+                )
+            except TypeError:  # pragma: no cover - old SciPy compatibility
+                distances, _ = tree.query(
+                    numpy_points,
+                    k=effective_neighbors + 1,
+                )
+            mean_squared_distance = torch.from_numpy(
+                (distances[:, 1:] ** 2).mean(axis=-1)
+            ).to(device=points.device, dtype=points.dtype)
+            mean_squared_distance.clamp_min_(minimum_squared_distance)
+            scales = mean_squared_distance.sqrt()
+            return scales[:, None].expand(-1, 3).clone()
+
+    # Half precision matrix products are unavailable on some CPU builds and
+    # lose too much precision for world-coordinate squared distances.
+    distance_dtype = (
+        torch.float32
+        if points.dtype in (torch.float16, torch.bfloat16)
+        else points.dtype
+    )
+    distance_points = points.detach().to(dtype=distance_dtype)
+    mean_squared_distances: list[Tensor] = []
+
+    for query_start in range(0, point_count, chunk_size):
+        query_stop = min(query_start + chunk_size, point_count)
+        query = distance_points[query_start:query_stop]
+        best = torch.full(
+            (query.shape[0], effective_neighbors),
+            torch.inf,
+            device=points.device,
+            dtype=distance_dtype,
+        )
+
+        for reference_start in range(0, point_count, chunk_size):
+            reference_stop = min(reference_start + chunk_size, point_count)
+            reference = distance_points[reference_start:reference_stop]
+            coordinate_differences = (
+                query[:, None, :] - reference[None, :, :]
+            )
+            squared_distances = coordinate_differences.square().sum(dim=-1)
+
+            overlap_start = max(query_start, reference_start)
+            overlap_stop = min(query_stop, reference_stop)
+            if overlap_start < overlap_stop:
+                diagonal = torch.arange(
+                    overlap_start,
+                    overlap_stop,
+                    device=points.device,
+                )
+                squared_distances[
+                    diagonal - query_start, diagonal - reference_start
+                ] = torch.inf
+
+            candidates = torch.cat((best, squared_distances), dim=-1)
+            best = torch.topk(
+                candidates,
+                k=effective_neighbors,
+                dim=-1,
+                largest=False,
+                sorted=False,
+            ).values
+
+        mean_squared_distances.append(best.mean(dim=-1))
+
+    mean_squared_distance = torch.cat(mean_squared_distances).clamp_min(
+        float(minimum_squared_distance)
+    )
+    scales = mean_squared_distance.sqrt().to(dtype=points.dtype)
+    return scales[:, None].expand(-1, 3).clone()
+
+
+def merge_colored_point_clouds(
+    point_clouds: Sequence[tuple[Tensor, Tensor]],
+    *,
+    voxel_size: float | None = None,
+) -> tuple[Tensor, Tensor]:
+    """Merge same-frame colored point clouds and optionally voxel-deduplicate.
+
+    This is intended for combining LiDAR and known-pose COLMAP/SfM points.
+    Every input must already use the same coordinate system, device, and dtype;
+    rejecting mismatches avoids silently merging an unaligned SfM model or
+    incurring an unexpected device transfer. When voxel_size is supplied,
+    positions and colors from both modalities are averaged per occupied voxel.
+    """
+
+    if not point_clouds:
+        raise ValueError("at least one point cloud is required")
+    for points, colors in point_clouds:
+        if points.device != colors.device:
+            raise ValueError(
+                "points and colors within each cloud must share a device"
+            )
+        if points.dtype != colors.dtype:
+            raise ValueError(
+                "points and colors within each cloud must share a dtype"
+            )
+    validated = [
+        _validated_points_and_colors(points, colors)
+        for points, colors in point_clouds
+    ]
+    reference_points = validated[0][0]
+    for points, colors in validated[1:]:
+        if points.device != reference_points.device:
+            raise ValueError("all point clouds must share a device")
+        if points.dtype != reference_points.dtype:
+            raise ValueError("all point clouds must share a dtype")
+        if colors.device != reference_points.device:
+            raise ValueError("all point clouds must share a device")
+        if colors.dtype != reference_points.dtype:
+            raise ValueError("all point clouds must share a dtype")
+
+    merged_points = torch.cat([points for points, _ in validated], dim=0)
+    merged_colors = torch.cat([colors for _, colors in validated], dim=0)
+    if voxel_size is None:
+        return merged_points, merged_colors
+    return voxel_downsample(merged_points, merged_colors, voxel_size)
+
+
 def initialize_gaussians_from_points(
     points: Tensor,
     colors: Tensor | None = None,
@@ -123,11 +360,13 @@ def initialize_gaussians_from_points(
     return GaussianSet(
         means=points.clone(),
         quaternions=quaternions,
-        scales=torch.full(
-            (count, 3),
-            config.initial_scale,
-            device=points.device,
-            dtype=points.dtype,
+        scales=estimate_knn_isotropic_scales(
+            points,
+            neighbor_count=config.knn_neighbors,
+            chunk_size=config.knn_chunk_size,
+            backend=config.knn_backend,
+            minimum_squared_distance=config.minimum_squared_distance,
+            singleton_scale=config.initial_scale,
         ),
         opacities=torch.full(
             (count, 1),
@@ -224,8 +463,10 @@ def load_colmap_points3d_text(path: str | Path) -> tuple[Tensor, Tensor]:
 
 __all__ = [
     "GaussianInitializationConfig",
+    "estimate_knn_isotropic_scales",
     "initialize_gaussians_from_points",
     "load_colmap_points3d_text",
+    "merge_colored_point_clouds",
     "voxel_downsample",
     "world_points_to_actor_local",
 ]

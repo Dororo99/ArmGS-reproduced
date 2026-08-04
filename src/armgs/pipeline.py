@@ -220,6 +220,7 @@ class ArmGSCompositeRenderer(nn.Module):
         cull_far_plane: float | None = None,
         cull_sigma_extent: float = 3.0,
         cull_eps2d: float | None = None,
+        active_sh_degree: int | None = None,
     ) -> None:
         super().__init__()
         self.core = core
@@ -237,6 +238,32 @@ class ArmGSCompositeRenderer(nn.Module):
         self.cull_far_plane = resolve(cull_far_plane, "far_plane", 1.0e10)
         self.cull_sigma_extent = float(cull_sigma_extent)
         self.cull_eps2d = resolve(cull_eps2d, "eps2d", 0.3)
+        maximum_degree = scene.background.sh_degree
+        if any(actor.gaussians.sh_degree != maximum_degree for actor in scene.actors):
+            raise ValueError("background and actor Gaussians must share one SH degree")
+        self._maximum_sh_degree = maximum_degree
+        self.set_active_sh_degree(
+            maximum_degree if active_sh_degree is None else active_sh_degree
+        )
+
+    @property
+    def maximum_sh_degree(self) -> int:
+        return self._maximum_sh_degree
+
+    @property
+    def active_sh_degree(self) -> int:
+        return self._active_sh_degree
+
+    def set_active_sh_degree(self, degree: int) -> None:
+        """Select the SH bands used by rendering without changing storage."""
+
+        if isinstance(degree, bool) or not isinstance(degree, int):
+            raise TypeError("active SH degree must be an integer")
+        if degree < 0 or degree > self.maximum_sh_degree:
+            raise ValueError(
+                f"active SH degree must lie in [0, {self.maximum_sh_degree}]"
+            )
+        self._active_sh_degree = degree
 
     def _frame_embedding(self, view: CameraView) -> Tensor:
         if view.training_row is not None:
@@ -280,7 +307,9 @@ class ArmGSCompositeRenderer(nn.Module):
             gaussians.means, camera_center
         )
         base_colors = spherical_harmonics_to_rgb(
-            gaussians.sh_coefficients, directions, gaussians.sh_degree
+            gaussians.sh_coefficients,
+            directions,
+            min(self.active_sh_degree, gaussians.sh_degree),
         )
         indices = self._validate_visible_indices(
             visible_indices, gaussians.count, gaussians.means.device
@@ -302,8 +331,10 @@ class ArmGSCompositeRenderer(nn.Module):
         timestamp = torch.as_tensor(view.timestamp)
         if timestamp.numel() != 1:
             raise ValueError("timestamp must be scalar")
-        active_actor_count = sum(
-            actor.is_active(timestamp) for actor in self.scene.actors
+        active_actor_gaussian_count = sum(
+            actor.gaussians.count
+            for actor in self.scene.actors
+            if actor.is_active(timestamp)
         )
         gaussians = self.scene.gaussians_at(self.core, timestamp.reshape(()))
         camera_to_world = _homogeneous_camera_to_world(
@@ -404,10 +435,10 @@ class ArmGSCompositeRenderer(nn.Module):
         if (
             actor_alpha is None
             and len(self.scene.actors) > 0
-            and active_actor_count == 0
+            and active_actor_gaussian_count == 0
         ):
-            # Frames outside every actor track still need an explicit zero map
-            # when the strict foreground objective is enabled.
+            # Frames with no renderable actor Gaussian still need an explicit
+            # zero map when the strict foreground objective is enabled.
             actor_alpha = torch.zeros_like(rasterization.accumulated_alpha)
 
         final_rgb = self.core.refine_image(

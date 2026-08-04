@@ -28,9 +28,33 @@ model:
     head_layers: 2             # paper
     position_frequencies: 6
     time_frequencies: 6
+  sky:
+    resolution: 256              # assumption
+    initial_color: [0.5, 0.5, 0.5]
+
+initialization:
+  initial_opacity: 0.1           # assumption: common 3DGS seed
+  initial_scale: 0.05            # singleton-only fallback; kNN otherwise
+  knn_neighbors: 3               # official 3DGS point-spacing scale
+  knn_chunk_size: 1024           # exact PyTorch fallback memory bound
+  knn_backend: auto              # CPU cKDTree, otherwise chunked PyTorch
+  minimum_squared_distance: 0.0000001
+  voxel_size: 0.1                # assumption: LiDAR voxel deduplication
+  actor_box_scale: 1.0           # assumption: centered canonical box
+
+data:
+  split:
+    every: 8                     # assumption: periodic capture holdout
+    offset: 0
+    start_position: 1            # preserve the boundary capture for actor lifecycle
+  sampler:
+    seed: 0
+    shuffle: true
+    num_workers: 0               # exact mid-epoch resume contract
 
 optimization:
   iterations: 30000            # paper
+  sh_degree_interval: 1000     # official 3DGS inherited schedule
   learning_rates:
     mean_initial: 0.00016       # paper
     mean_final: 0.0000016       # paper
@@ -46,6 +70,17 @@ optimization:
     start_iteration: 500       # paper
     end_iteration: 15000       # paper
     interval: 100              # paper
+    position_gradient_threshold: 0.0002  # assumption: clean gsplat baseline
+    split_scale_fraction_of_scene: 0.01  # assumption: clean gsplat baseline
+    prune_opacity_threshold: 0.005       # assumption: clean gsplat baseline
+    split_children: 2                    # assumption
+    split_scale_reduction: 1.6           # assumption: clean gsplat baseline
+    opacity_reset_value: 0.01            # assumption: 2 * prune threshold
+    opacity_reset_interval: 3000         # assumption: clean gsplat baseline
+    max_screen_radius: 20                 # official 3DGS pixel threshold
+    prune_world_scale_fraction_of_scene: 0.1
+    prune_large_after_iteration: 3000
+    minimum_gaussians: 0                  # no non-reference rescue
 
 loss:
   lambda_ssim: 0.2             # paper lambda_1
@@ -56,4 +91,3 @@ loss:
   lambda_depth: 0.01           # paper lambda_2
   lambda_sky: 0.05             # paper lambda_3
   lambda_foreground: 0.1       # paper lambda_4
-

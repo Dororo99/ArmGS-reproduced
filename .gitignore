@@ -5,3 +5,11 @@ __pycache__/
 *.egg-info/
 .coverage
 *.orig
+
+# Grounded SAM source, weights, and generated masks are reproducible artifacts.
+/third_party/Grounded-Segment-Anything/
+/checkpoints/grounded_sam/
+/data/nuscenes
+/data/sky_masks/
+/data/waymo_prepared/
+/outputs/

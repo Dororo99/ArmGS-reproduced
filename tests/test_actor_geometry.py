@@ -40,6 +40,27 @@ def test_actor_refiner_starts_with_no_deformation() -> None:
     assert refiner.position_head.final_layer.weight.grad is not None
 
 
+def test_actor_refiner_supports_an_empty_set_after_density_pruning() -> None:
+    actor = make_gaussians(count=0, degree=1)
+    refiner = ActorDeformationRefiner(
+        sh_degree=1,
+        hidden_dim=16,
+        position_frequencies=2,
+        time_frequencies=2,
+    )
+
+    deformation = refiner(
+        actor.means,
+        actor.sh_coefficients,
+        torch.tensor(0.25),
+    )
+
+    assert deformation.means.shape == (0, 3)
+    assert deformation.sh_coefficients.shape == (0, 4, 3)
+    assert deformation.delta_means.shape == (0, 3)
+    assert deformation.delta_sh.shape == (0, 4, 3)
+
+
 def test_actor_pose_transform_uses_quaternion_composition() -> None:
     actor = make_gaussians(count=1, degree=0).with_updates(
         means=torch.tensor([[1.0, 0.0, 0.0]])
@@ -115,3 +136,21 @@ def test_pose_module_float_preserves_absolute_timestamp_precision() -> None:
         torch.tensor(start + 500_000, dtype=torch.int64)
     )
     torch.testing.assert_close(pose.translations, torch.tensor([[0.5, 0.0, 0.0]]))
+
+
+def test_pose_trajectory_can_extrapolate_for_held_out_camera_time() -> None:
+    trajectory = PoseTrajectory(
+        timestamps=torch.tensor([100, 200], dtype=torch.int64),
+        quaternions=torch.tensor(
+            [[1.0, 0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]]
+        ),
+        translations=torch.tensor([[1.0, 0.0, 0.0], [2.0, 0.0, 0.0]]),
+    )
+
+    clamped = trajectory.interpolate(torch.tensor(0, dtype=torch.int64))
+    extrapolated = trajectory.interpolate(
+        torch.tensor(0, dtype=torch.int64), extrapolate=True
+    )
+
+    torch.testing.assert_close(clamped.translations[0], torch.tensor([1.0, 0.0, 0.0]))
+    torch.testing.assert_close(extrapolated.translations[0], torch.zeros(3))

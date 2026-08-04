@@ -7,6 +7,11 @@ import torch
 
 from armgs.backends import GsplatRasterizer
 from armgs.config import build_core, build_loss, load_config
+from armgs.density import (
+    DensityControlThresholds,
+    GaussianDensityPolicy,
+    GsplatDensityController,
+)
 from armgs.geometry import PoseTrajectory
 from armgs.pipeline import ArmGSCompositeRenderer, CameraView
 from armgs.scene import (
@@ -95,7 +100,32 @@ def test_real_gsplat_full_composite_pipeline_backward() -> None:
         actor_alpha=output.actor_alpha,
         actor_bbox_mask=torch.ones_like(output.actor_alpha, dtype=torch.bool),
     )
+    density = GsplatDensityController(
+        {
+            -1: renderer.scene.background,
+            0: renderer.scene.actors[0].gaussians,
+        },
+        GaussianDensityPolicy(
+            DensityControlThresholds(
+                position_gradient_threshold=0.0002,
+                split_scale_threshold=0.01,
+                prune_opacity_threshold=0.005,
+                split_children=2,
+                split_scale_reduction=1.6,
+                opacity_reset_value=0.01,
+            )
+        ),
+    )
+    metadata = output.rasterization.metadata
+    assert metadata is not None
+    density.before_backward(metadata)
     loss.total.backward()
+    assert output.composite_gaussians.group_ids is not None
+    density.after_backward(
+        metadata, output.composite_gaussians.group_ids
+    )
+    assert density.accumulator(-1).observation_count.sum() > 0
+    assert density.accumulator(0).observation_count.sum() > 0
 
     assert torch.isfinite(loss.total)
     assert renderer.scene.background.means.grad is not None

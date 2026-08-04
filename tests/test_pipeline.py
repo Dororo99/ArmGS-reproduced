@@ -15,6 +15,12 @@ from armgs.appearance import (
 )
 from armgs.compositing import front_to_back_composite
 from armgs.config import build_loss, load_config
+from armgs.density import (
+    DensificationSchedule,
+    DensityControlThresholds,
+    GaussianDensityPolicy,
+    GsplatDensityController,
+)
 from armgs.encodings import HashGridEncoder
 from armgs.geometry import PoseTrajectory
 from armgs.losses import ArmGSLoss
@@ -45,17 +51,25 @@ def rgb_to_degree_zero_sh(rgb: torch.Tensor) -> torch.Tensor:
     return ((rgb - 0.5) / _C0).reshape(1, 1, 3)
 
 
-def make_gaussian(mean: list[float], rgb: list[float], opacity: float = 0.8) -> GaussianSet:
+def make_gaussian(
+    mean: list[float],
+    rgb: list[float],
+    opacity: float = 0.8,
+    *,
+    sh_degree: int = 0,
+) -> GaussianSet:
+    sh_coefficients = torch.zeros(1, (sh_degree + 1) ** 2, 3)
+    sh_coefficients[:, :1] = rgb_to_degree_zero_sh(torch.tensor(rgb))
     return GaussianSet(
         means=torch.tensor([mean], dtype=torch.float32),
         quaternions=torch.tensor([[1.0, 0.0, 0.0, 0.0]]),
         scales=torch.full((1, 3), 0.1),
         opacities=torch.tensor([[opacity]]),
-        sh_coefficients=rgb_to_degree_zero_sh(torch.tensor(rgb)),
+        sh_coefficients=sh_coefficients,
     )
 
 
-def make_core() -> ArmGSCore:
+def make_core(sh_degree: int = 0) -> ArmGSCore:
     embedding_dim = 4
     return ArmGSCore(
         FrameAppearanceEmbedding(1, embedding_dim),
@@ -78,7 +92,7 @@ def make_core() -> ArmGSCore:
             num_layers=4,
         ),
         ActorDeformationRefiner(
-            0,
+            sh_degree,
             hidden_dim=8,
             position_frequencies=1,
             time_frequencies=1,
@@ -120,20 +134,44 @@ class OnePixelDepthRasterizer:
         )
 
 
-def make_renderer() -> tuple[ArmGSCompositeRenderer, OnePixelDepthRasterizer]:
-    core = make_core()
+def make_renderer(
+    sh_degree: int = 0,
+    *,
+    empty_actor: bool = False,
+) -> tuple[ArmGSCompositeRenderer, OnePixelDepthRasterizer]:
+    core = make_core(sh_degree)
     background = LearnableGaussianSet(
-        make_gaussian([0.0, 0.0, 4.0], [1.0, 0.0, 0.0])
+        make_gaussian(
+            [0.0, 0.0, 4.0],
+            [1.0, 0.0, 0.0],
+            sh_degree=sh_degree,
+        )
     )
-    actor_gaussians = LearnableGaussianSet(
-        make_gaussian([0.0, 0.0, 0.0], [0.0, 1.0, 0.0])
+    actor_initial = make_gaussian(
+        [0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        sh_degree=sh_degree,
     )
+    if empty_actor:
+        actor_initial = actor_initial.with_updates(
+            means=actor_initial.means[:0],
+            quaternions=actor_initial.quaternions[:0],
+            scales=actor_initial.scales[:0],
+            opacities=actor_initial.opacities[:0],
+            sh_coefficients=actor_initial.sh_coefficients[:0],
+        )
+    actor_gaussians = LearnableGaussianSet(actor_initial)
     trajectory = PoseTrajectory(
         torch.tensor([0], dtype=torch.int64),
         torch.tensor([[1.0, 0.0, 0.0, 0.0]]),
         torch.tensor([[0.0, 0.0, 2.0]]),
     )
-    actor = DynamicActorModel(actor_gaussians, trajectory, actor_id=7)
+    actor = DynamicActorModel(
+        actor_gaussians,
+        trajectory,
+        actor_id=7,
+        dimensions_lwh=torch.tensor([4.0, 2.0, 2.0]),
+    )
     sky = ExplicitCubemapSky(resolution=2, initial_color=(0.0, 0.0, 1.0))
     scene = CompositeGaussianScene(
         background,
@@ -307,7 +345,8 @@ def test_trainer_registers_every_parameter_group_and_resumes_exactly() -> None:
     trainer = ArmGSTrainer.from_config(renderer, build_loss(config), config)
     group_names = {group["name"] for group in trainer.optimizer.param_groups}
     assert group_names == {
-        "means",
+        "means/background",
+        "means/actor/7",
         "rotations",
         "scales",
         "opacities",
@@ -317,6 +356,16 @@ def test_trainer_registers_every_parameter_group_and_resumes_exactly() -> None:
         "actor_deformation",
         "sky",
     }
+    assert trainer.optimizer.defaults["eps"] == 1.0e-15
+    mean_groups = {
+        group["name"]: group for group in trainer.optimizer.param_groups
+        if str(group["name"]).startswith("means/")
+    }
+    assert mean_groups["means/background"]["spatial_lr_scale"] == 1.0
+    assert mean_groups["means/actor/7"]["spatial_lr_scale"] == 3.0
+    assert mean_groups["means/actor/7"]["lr"] == pytest.approx(
+        3.0 * config["optimization"]["learning_rates"]["mean_initial"]
+    )
     final_lr = trainer.mean_scheduler.learning_rate_at(
         config["optimization"]["iterations"] - 1
     )
@@ -330,12 +379,14 @@ def test_trainer_registers_every_parameter_group_and_resumes_exactly() -> None:
         target_rgb=torch.full_like(reference.rgb, 0.25),
         lidar_depth=reference.depth + 0.5,
         target_sky_mask=torch.zeros_like(reference.non_sky_accumulated_alpha),
+        sky_valid_mask=torch.tensor(False).reshape(1, 1, 1, 1),
         actor_bbox_mask=torch.ones_like(reference.actor_alpha, dtype=torch.bool),
     )
     result = trainer.train_step(batch)
     assert result.step == 0
     assert trainer.step == 1
     assert torch.isfinite(result.losses.total)
+    torch.testing.assert_close(result.losses.sky, torch.tensor(0.0))
 
     state = trainer.state_dict()
     expected_random = torch.rand(4)
@@ -350,6 +401,35 @@ def test_trainer_registers_every_parameter_group_and_resumes_exactly() -> None:
         expected = trainer.renderer(make_view()).rgb
         actual = restored.renderer(make_view()).rgb
     torch.testing.assert_close(actual, expected)
+
+
+def test_trainer_activates_sh_bands_every_thousand_steps() -> None:
+    config = load_config(
+        Path(__file__).resolve().parents[1] / "configs" / "armgs_default.yaml"
+    )
+    renderer, _ = make_renderer(sh_degree=3)
+    trainer = ArmGSTrainer.from_config(
+        renderer,
+        ArmGSLoss(
+            lambda_ssim=0.0,
+            lambda_depth=0.0,
+            lambda_sky=0.0,
+            lambda_foreground=0.0,
+        ),
+        config,
+    )
+    batch = ArmGSTrainingBatch(
+        view=make_view(),
+        target_rgb=torch.full((1, 1, 1, 3), 0.25),
+    )
+
+    assert renderer.active_sh_degree == 0
+    trainer.step = 999
+    trainer.train_step(batch)
+    assert renderer.active_sh_degree == 1
+    trainer.step = 2_999
+    trainer.train_step(batch)
+    assert renderer.active_sh_degree == 3
 
 
 def test_actor_is_not_ghosted_outside_its_track_interval() -> None:
@@ -380,6 +460,21 @@ def test_active_actor_does_not_hide_missing_backend_alpha_support() -> None:
     renderer.rasterizer = NoActorAlphaRasterizer()
     output = renderer(make_view())
     assert output.actor_alpha is None
+
+
+def test_active_actor_with_no_gaussians_renders_background_and_zero_alpha() -> None:
+    renderer, rasterizer = make_renderer(empty_actor=True)
+
+    class NoActorAlphaRasterizer:
+        def __call__(self, inputs: RasterizationInput) -> RasterizationOutput:
+            return replace(rasterizer(inputs), actor_alpha=None)
+
+    renderer.rasterizer = NoActorAlphaRasterizer()
+    output = renderer(make_view())
+
+    assert output.composite_gaussians.count == 1
+    assert output.actor_alpha is not None
+    torch.testing.assert_close(output.actor_alpha, torch.zeros_like(output.actor_alpha))
 
 
 def test_near_zero_gaussian_quaternion_is_rejected() -> None:
@@ -493,3 +588,257 @@ def test_trainer_checkpoint_restores_sampler_mid_epoch() -> None:
     )
     with pytest.raises(ValueError, match="trainer has no sampler"):
         trainer_without_sampler.load_state_dict(state)
+
+
+def test_trainer_applies_gsplat_density_and_resumes_changed_topology() -> None:
+    class DensityMetadataRasterizer:
+        def __init__(self) -> None:
+            self.base = OnePixelDepthRasterizer()
+
+        def __call__(self, inputs: RasterizationInput) -> RasterizationOutput:
+            output = self.base(inputs)
+            means2d = inputs.means[:, :2] * 1.0
+            screen_term = means2d.sum() * 0.01
+            count = inputs.means.shape[0]
+            return replace(
+                output,
+                rgb=output.rgb + screen_term,
+                metadata={
+                    "means2d": means2d,
+                    "radii": torch.ones(
+                        count, 2, device=inputs.means.device
+                    ),
+                    "gaussian_ids": torch.arange(
+                        count, device=inputs.means.device
+                    ),
+                    "width": 1,
+                    "height": 1,
+                    "n_cameras": 1,
+                },
+            )
+
+    def make_policy() -> GaussianDensityPolicy:
+        return GaussianDensityPolicy(
+            DensityControlThresholds(
+                position_gradient_threshold=0.0,
+                split_scale_threshold=1.0,
+                prune_opacity_threshold=0.0,
+                split_children=2,
+                split_scale_reduction=1.6,
+                opacity_reset_value=0.1,
+            ),
+            schedule=DensificationSchedule(
+                start_step=0, end_step=2, interval=1
+            ),
+        )
+
+    def attach_controller(
+        renderer: ArmGSCompositeRenderer,
+    ) -> GsplatDensityController:
+        return GsplatDensityController(
+            {
+                -1: renderer.scene.background,
+                **{
+                    actor.actor_id: actor.gaussians
+                    for actor in renderer.scene.actors
+                },
+            },
+            make_policy(),
+        )
+
+    config = load_config(
+        Path(__file__).resolve().parents[1]
+        / "configs"
+        / "armgs_default.yaml"
+    )
+    renderer, _ = make_renderer()
+    renderer.rasterizer = DensityMetadataRasterizer()
+    controller = attach_controller(renderer)
+    trainer = ArmGSTrainer.from_config(
+        renderer,
+        build_loss(config),
+        config,
+        density_controller=controller,
+    )
+    with torch.no_grad():
+        reference = renderer(make_view())
+    assert reference.actor_alpha is not None
+    batch = ArmGSTrainingBatch(
+        view=make_view(),
+        target_rgb=torch.full_like(reference.rgb, 0.25),
+        lidar_depth=reference.depth + 0.5,
+        target_sky_mask=torch.zeros_like(
+            reference.non_sky_accumulated_alpha
+        ),
+        actor_bbox_mask=torch.ones_like(
+            reference.actor_alpha, dtype=torch.bool
+        ),
+    )
+
+    output = trainer.train_step(batch)
+
+    assert output.density_updates is not None
+    assert set(output.density_updates) == {-1, 7}
+    assert renderer.scene.background.count == 2
+    assert renderer.scene.actors[0].gaussians.count == 2
+    assert controller.accumulator(-1).count == 2
+    assert controller.accumulator(7).count == 2
+
+    checkpoint = trainer.state_dict()
+    restored_renderer, _ = make_renderer()
+    restored_renderer.rasterizer = DensityMetadataRasterizer()
+    restored_controller = attach_controller(restored_renderer)
+    restored = ArmGSTrainer.from_config(
+        restored_renderer,
+        build_loss(config),
+        config,
+        density_controller=restored_controller,
+    )
+    restored.load_state_dict(checkpoint)
+
+    assert restored_renderer.scene.background.count == 2
+    assert restored_renderer.scene.actors[0].gaussians.count == 2
+    assert restored_controller.accumulator(-1).count == 2
+    assert restored_controller.accumulator(7).count == 2
+    for expected, actual in zip(
+        trainer.renderer.parameters(), restored.renderer.parameters()
+    ):
+        torch.testing.assert_close(actual, expected)
+
+    accumulated_before = {
+        group_id: controller.accumulator(group_id).observation_count.clone()
+        for group_id in (-1, 7)
+    }
+    post_schedule = trainer.train_step(batch)
+    assert post_schedule.density_updates is None
+    for group_id, expected in accumulated_before.items():
+        torch.testing.assert_close(
+            controller.accumulator(group_id).observation_count, expected
+        )
+
+
+def test_training_continues_after_density_prunes_every_actor_gaussian() -> None:
+    class DensityMetadataRasterizer:
+        def __init__(self) -> None:
+            self.base = OnePixelDepthRasterizer()
+
+        def __call__(self, inputs: RasterizationInput) -> RasterizationOutput:
+            output = self.base(inputs)
+            means2d = inputs.means[:, :2] * 1.0
+            count = inputs.means.shape[0]
+            return replace(
+                output,
+                rgb=output.rgb + means2d.sum() * 0.01,
+                metadata={
+                    "means2d": means2d,
+                    "radii": torch.ones(
+                        count, 2, device=inputs.means.device
+                    ),
+                    "gaussian_ids": torch.arange(
+                        count, device=inputs.means.device
+                    ),
+                    "width": 1,
+                    "height": 1,
+                    "n_cameras": 1,
+                },
+            )
+
+    renderer, _ = make_renderer()
+    actor = renderer.scene.actors[0]
+    with torch.no_grad():
+        actor.gaussians.opacity_logits.fill_(
+            torch.logit(torch.tensor(0.001))
+        )
+    renderer.rasterizer = DensityMetadataRasterizer()
+    policy = GaussianDensityPolicy(
+        DensityControlThresholds(
+            position_gradient_threshold=100.0,
+            split_scale_threshold=1.0,
+            prune_opacity_threshold=0.005,
+            split_children=2,
+            split_scale_reduction=1.6,
+            opacity_reset_value=0.1,
+        ),
+        schedule=DensificationSchedule(
+            start_step=0, end_step=3, interval=1
+        ),
+    )
+    controller = GsplatDensityController(
+        {
+            -1: renderer.scene.background,
+            actor.actor_id: actor.gaussians,
+        },
+        policy,
+    )
+    config = load_config(
+        Path(__file__).resolve().parents[1]
+        / "configs"
+        / "armgs_default.yaml"
+    )
+    trainer = ArmGSTrainer.from_config(
+        renderer,
+        build_loss(config),
+        config,
+        density_controller=controller,
+    )
+    reference = renderer(make_view())
+    assert reference.actor_alpha is not None
+    batch = ArmGSTrainingBatch(
+        view=make_view(),
+        target_rgb=torch.full_like(reference.rgb, 0.25),
+        lidar_depth=reference.depth.detach() + 0.5,
+        target_sky_mask=torch.zeros_like(
+            reference.non_sky_accumulated_alpha
+        ),
+        actor_bbox_mask=torch.ones_like(
+            reference.actor_alpha, dtype=torch.bool
+        ),
+    )
+
+    first = trainer.train_step(batch)
+    assert first.density_updates is not None
+    actor_update = first.density_updates[actor.actor_id]
+    assert (actor_update.old_count, actor_update.new_count) == (1, 0)
+    assert actor.gaussians.count == 0
+
+    second = trainer.train_step(batch)
+    assert second.step == 1
+    assert torch.isfinite(second.losses.total)
+    assert second.rendering.actor_alpha is not None
+    torch.testing.assert_close(
+        second.rendering.actor_alpha,
+        torch.zeros_like(second.rendering.actor_alpha),
+    )
+    assert actor.gaussians.means.shape == (0, 3)
+    assert actor.gaussians.means.grad is None
+    assert controller.accumulator(actor.actor_id).count == 0
+
+
+def test_tiny_scene_overfits_one_training_view() -> None:
+    config = load_config(
+        Path(__file__).resolve().parents[1]
+        / "configs"
+        / "armgs_default.yaml"
+    )
+    renderer, _ = make_renderer()
+    trainer = ArmGSTrainer.from_config(
+        renderer,
+        ArmGSLoss(
+            lambda_ssim=0.0,
+            lambda_depth=0.0,
+            lambda_sky=0.0,
+            lambda_foreground=0.0,
+        ),
+        config,
+    )
+    batch = ArmGSTrainingBatch(
+        view=make_view(),
+        target_rgb=torch.tensor([[[[0.15, 0.65, 0.25]]]]),
+    )
+
+    losses = [
+        float(trainer.train_step(batch).losses.total.detach())
+        for _ in range(30)
+    ]
+
+    assert losses[-1] < losses[0] * 0.2

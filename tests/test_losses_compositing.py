@@ -67,6 +67,41 @@ def test_sky_and_foreground_losses_have_expected_preferences() -> None:
     assert crisp < uncertain
 
 
+def test_rejected_sky_validity_zeros_only_sky_loss_under_strict_mode() -> None:
+    image = torch.zeros(1, 4, 5, 3)
+    alpha = torch.full((1, 4, 5, 1), 0.8, requires_grad=True)
+    target_sky = torch.ones_like(alpha)
+    loss = ArmGSLoss(
+        lambda_ssim=0.0,
+        lambda_depth=0.0,
+        lambda_sky=1.0,
+        lambda_foreground=0.0,
+        require_auxiliary=True,
+    )
+
+    rejected = loss(
+        image,
+        image,
+        non_sky_accumulated_alpha=alpha,
+        target_sky_mask=target_sky,
+        sky_valid_mask=torch.tensor(False).reshape(1, 1, 1, 1),
+    )
+    rejected.total.backward()
+
+    torch.testing.assert_close(rejected.sky, torch.tensor(0.0))
+    assert alpha.grad is not None
+    torch.testing.assert_close(alpha.grad, torch.zeros_like(alpha))
+
+    valid = loss(
+        image,
+        image,
+        non_sky_accumulated_alpha=alpha.detach(),
+        target_sky_mask=target_sky,
+        sky_valid_mask=torch.tensor(True).reshape(1, 1, 1, 1),
+    )
+    assert valid.sky > 0
+
+
 def test_full_loss_backpropagates_and_stays_finite() -> None:
     prediction = torch.rand(1, 8, 9, 3, requires_grad=True)
     target = torch.zeros_like(prediction)

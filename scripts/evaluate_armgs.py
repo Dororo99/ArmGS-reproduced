@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Evaluate ArmGS RGB tensors without image-library dependencies."""
+"""Evaluate ArmGS RGB tensors or ordinary image files."""
 
 from __future__ import annotations
 
@@ -20,18 +20,33 @@ if str(SOURCE_ROOT) not in sys.path:
 from armgs.evaluation import EvaluationAccumulator, LPIPSUnavailableError
 
 
+_RGB_IMAGE_SUFFIXES = frozenset({".jpg", ".jpeg", ".png"})
+_RGB_INPUT_SUFFIXES = _RGB_IMAGE_SUFFIXES | {".pt"}
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Compute PSNR/SSIM/optional LPIPS and actor-mask PSNR from .pt tensors."
+        description=(
+            "Compute PSNR/SSIM/optional LPIPS and actor-mask PSNR from RGB "
+            ".pt tensors or PNG/JPEG images."
+        )
     )
     source = parser.add_mutually_exclusive_group(required=True)
-    source.add_argument("--prediction", type=Path, help="prediction RGB tensor (.pt)")
+    source.add_argument(
+        "--prediction",
+        type=Path,
+        help="prediction RGB tensor/image (.pt, .png, .jpg, or .jpeg)",
+    )
     source.add_argument(
         "--manifest",
         type=Path,
         help="JSON manifest, or directory containing manifest.json",
     )
-    parser.add_argument("--target", type=Path, help="target RGB tensor (.pt)")
+    parser.add_argument(
+        "--target",
+        type=Path,
+        help="target RGB tensor/image (.pt, .png, .jpg, or .jpeg)",
+    )
     parser.add_argument("--valid-mask", type=Path, help="optional valid mask tensor (.pt)")
     parser.add_argument("--actor-mask", type=Path, help="optional actor mask tensor (.pt)")
     parser.add_argument("--data-range", type=float, default=1.0)
@@ -63,6 +78,41 @@ def _load_tensor(path: Path, *, role: str) -> torch.Tensor:
     return value.cpu()
 
 
+def _load_rgb_image(path: Path, *, role: str) -> torch.Tensor:
+    if not path.is_file():
+        raise FileNotFoundError(f"{role} image file does not exist: {path}")
+    try:
+        from PIL import Image
+    except ImportError as error:
+        raise ImportError(
+            "PNG/JPEG evaluation requires optional dependency 'Pillow'; "
+            "install the ArmGS 'data' extra"
+        ) from error
+    try:
+        with Image.open(path) as image:
+            image = image.convert("RGB")
+            width, height = image.size
+            pixels = torch.frombuffer(
+                bytearray(image.tobytes()), dtype=torch.uint8
+            ).clone()
+    except (OSError, ValueError) as error:
+        raise ValueError(f"failed to load {role} RGB image {path}: {error}") from error
+    return pixels.reshape(height, width, 3)
+
+
+def _load_rgb(path: Path, *, role: str) -> torch.Tensor:
+    suffix = path.suffix.lower()
+    if suffix == ".pt":
+        return _load_tensor(path, role=role)
+    if suffix in _RGB_IMAGE_SUFFIXES:
+        return _load_rgb_image(path, role=role)
+    supported = ", ".join(sorted(_RGB_INPUT_SUFFIXES))
+    raise ValueError(
+        f"unsupported {role} file extension '{path.suffix}': {path}; "
+        f"expected one of {supported}"
+    )
+
+
 def _resolve_path(value: str | Path, *, root: Path) -> Path:
     path = Path(value)
     return path if path.is_absolute() else root / path
@@ -79,10 +129,13 @@ def _directory_entries(payload: dict[str, Any], *, root: Path) -> list[dict[str,
             raise FileNotFoundError("manifest prediction_dir and target_dir must exist")
         prediction_files = {
             path.relative_to(prediction_dir).as_posix()
-            for path in prediction_dir.rglob("*.pt")
+            for path in prediction_dir.rglob("*")
+            if path.is_file() and path.suffix.lower() in _RGB_INPUT_SUFFIXES
         }
         target_files = {
-            path.relative_to(target_dir).as_posix() for path in target_dir.rglob("*.pt")
+            path.relative_to(target_dir).as_posix()
+            for path in target_dir.rglob("*")
+            if path.is_file() and path.suffix.lower() in _RGB_INPUT_SUFFIXES
         }
         if prediction_files != target_files:
             missing_predictions = sorted(target_files - prediction_files)
@@ -188,8 +241,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     entries = _input_entries(args)
     for entry in entries:
         accumulator.update(
-            _load_tensor(entry["prediction"], role="prediction"),
-            _load_tensor(entry["target"], role="target"),
+            _load_rgb(entry["prediction"], role="prediction"),
+            _load_rgb(entry["target"], role="target"),
             valid_mask=(
                 _load_tensor(entry["valid_mask"], role="valid mask")
                 if "valid_mask" in entry
@@ -216,6 +269,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     except (
         FileNotFoundError,
+        ImportError,
         LPIPSUnavailableError,
         OSError,
         RuntimeError,

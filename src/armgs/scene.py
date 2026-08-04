@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+import math
 
 import torch
 from torch import Tensor, nn
@@ -102,6 +103,8 @@ class DynamicActorModel(nn.Module):
         *,
         actor_id: int,
         render_outside_track: bool = False,
+        lifecycle_timestamps: tuple[Tensor, Tensor] | None = None,
+        dimensions_lwh: Tensor | None = None,
     ) -> None:
         super().__init__()
         if actor_id < 0:
@@ -110,6 +113,61 @@ class DynamicActorModel(nn.Module):
         self.trajectory = trajectory
         self.actor_id = int(actor_id)
         self.render_outside_track = bool(render_outside_track)
+        if lifecycle_timestamps is None:
+            lifecycle_timestamps = (
+                trajectory.timestamps[0].detach().clone(),
+                trajectory.timestamps[-1].detach().clone(),
+            )
+        lifecycle_start, lifecycle_end = lifecycle_timestamps
+        if lifecycle_start.numel() != 1 or lifecycle_end.numel() != 1:
+            raise ValueError("actor lifecycle timestamps must be scalar")
+        if int(lifecycle_start.item()) > int(lifecycle_end.item()):
+            raise ValueError("actor lifecycle start must not exceed its end")
+        if (
+            float(lifecycle_start.item()) > float(trajectory.timestamps[0].item())
+            or float(lifecycle_end.item()) < float(trajectory.timestamps[-1].item())
+        ):
+            raise ValueError("actor lifecycle must contain its pose trajectory")
+        self.register_buffer(
+            "lifecycle_start_timestamp", lifecycle_start.detach().reshape(()).clone()
+        )
+        self.register_buffer(
+            "lifecycle_end_timestamp", lifecycle_end.detach().reshape(()).clone()
+        )
+        if dimensions_lwh is not None:
+            if dimensions_lwh.shape != (3,) or not dimensions_lwh.is_floating_point():
+                raise ValueError("actor dimensions_lwh must be floating point [3]")
+            if not torch.isfinite(dimensions_lwh).all() or torch.any(
+                dimensions_lwh <= 0
+            ):
+                raise ValueError("actor dimensions_lwh must be finite and positive")
+            dimensions_lwh = dimensions_lwh.detach().clone()
+        self.register_buffer("dimensions_lwh", dimensions_lwh)
+
+    @property
+    def lifecycle(self) -> tuple[Tensor, Tensor]:
+        return self.lifecycle_start_timestamp, self.lifecycle_end_timestamp
+
+    def density_extent(self, actor_box_scale: float = 1.0) -> float:
+        """Return the StreetGS object-space extent used for LR/density control."""
+
+        if not math.isfinite(actor_box_scale) or actor_box_scale <= 0.0:
+            raise ValueError("actor_box_scale must be finite and positive")
+        if self.dimensions_lwh is None:
+            raise ValueError("actor dimensions_lwh are required for density extent")
+        length, width, height = self.dimensions_lwh.detach().to(
+            device="cpu", dtype=torch.float64
+        )
+        return float(
+            torch.stack(
+                (
+                    1.5 * length / actor_box_scale,
+                    1.5 * width / actor_box_scale,
+                    height,
+                )
+            ).max().item()
+            / 2.0
+        )
 
     def is_active(self, timestamp: Tensor) -> bool:
         """Return whether this actor exists at the queried dataset timestamp."""
@@ -118,11 +176,11 @@ class DynamicActorModel(nn.Module):
             raise ValueError("actor activity query requires one scalar timestamp")
         if self.render_outside_track:
             return True
-        query = timestamp.detach().reshape(()).to(self.trajectory.timestamps)
+        query = timestamp.detach().reshape(()).to(self.lifecycle_start_timestamp)
         return bool(
             (
-                (query >= self.trajectory.timestamps[0])
-                & (query <= self.trajectory.timestamps[-1])
+                (query >= self.lifecycle_start_timestamp)
+                & (query <= self.lifecycle_end_timestamp)
             ).item()
         )
 
@@ -136,7 +194,7 @@ class DynamicActorModel(nn.Module):
             raise ValueError("actor rendering requires one scalar timestamp")
         canonical = self.gaussians.activated(group_id=self.actor_id)
         deformed = core.deform_actor(canonical, normalized_timestamp.reshape(()))
-        pose = self.trajectory.interpolate(timestamp.reshape(()))
+        pose = self.trajectory.interpolate(timestamp.reshape(()), extrapolate=True)
         return transform_actor_gaussians(
             deformed, pose.quaternions[0], pose.translations[0]
         )
@@ -175,7 +233,7 @@ class CompositeGaussianScene(nn.Module):
             sets.extend(
                 actor.world_gaussians(core, timestamp, normalized_timestamp)
                 for actor in self.actors
-                if actor.is_active(timestamp)
+                if actor.is_active(timestamp) and actor.gaussians.count > 0
             )
         return GaussianSet.concatenate(sets)
 

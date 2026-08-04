@@ -10,7 +10,7 @@ nanoseconds, never float32 seconds.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from decimal import Decimal, InvalidOperation, ROUND_HALF_EVEN
 import math
 from pathlib import Path
@@ -520,7 +520,14 @@ def canonicalize_kitti_tracklets(
     camera0_to_world: Sequence[Tensor],
     calibration: KittiCalibration,
 ) -> tuple[ActorTrack, ...]:
-    """Transform Velodyne-frame KITTI tracks into world-frame actor tracks."""
+    """Transform Velodyne-frame KITTI tracks into centered world actor poses.
+
+    KITTI tracklet translations locate the bottom center of a box. Velodyne
+    coordinates use ``+z`` as up, while the canonical actor frame is centered,
+    so the pose origin is shifted by the rotated local offset ``[0, 0, h/2]``.
+    The stored dimensions remain ordered as canonical
+    ``[length, width, height]``.
+    """
 
     if timestamps.ndim != 1 or timestamps.dtype != torch.int64:
         raise ValueError("timestamps must be a one-dimensional int64 tensor")
@@ -529,6 +536,7 @@ def canonicalize_kitti_tracklets(
     camera0_from_lidar = calibration.lidar_to_rectified_camera0
     tracks: list[ActorTrack] = []
     for actor_id, tracklet in enumerate(tracklets):
+        height = tracklet.dimensions_hwl[0]
         samples: list[ActorTrackSample] = []
         for pose in tracklet.poses:
             if pose.frame_index >= timestamps.numel():
@@ -538,11 +546,21 @@ def canonicalize_kitti_tracklets(
             world_from_lidar = world_from_camera0 @ camera0_from_lidar.to(
                 world_from_camera0
             )
-            lidar_from_actor = torch.eye(4, dtype=world_from_lidar.dtype)
-            lidar_from_actor[:3, :3] = _rpy_rotation_matrix(
+            lidar_from_actor = torch.eye(
+                4, dtype=world_from_lidar.dtype, device=world_from_lidar.device
+            )
+            actor_rotation = _rpy_rotation_matrix(
                 pose.rotation_rpy.to(world_from_lidar)
             )
-            lidar_from_actor[:3, 3] = pose.translation_lidar.to(world_from_lidar)
+            lidar_from_actor[:3, :3] = actor_rotation
+            center_offset_actor = torch.zeros(
+                3, dtype=world_from_lidar.dtype, device=world_from_lidar.device
+            )
+            center_offset_actor[2] = height.to(world_from_lidar) / 2.0
+            lidar_from_actor[:3, 3] = (
+                pose.translation_lidar.to(world_from_lidar)
+                + actor_rotation @ center_offset_actor
+            )
             world_from_actor = world_from_lidar @ lidar_from_actor
             samples.append(
                 ActorTrackSample(
@@ -639,9 +657,15 @@ def load_kitti_manifest(
     sky_mask_dirs: Mapping[int, str | Path] | None = None,
     actor_mask_dirs: Mapping[int, str | Path] | None = None,
     require_lidar: bool = True,
+    retain_unprojected_lidar: bool = False,
     camera_convention: CameraConvention = "opencv",
 ) -> CanonicalDatasetManifest:
-    """Load a validated, indexable canonical manifest from a KITTI sequence."""
+    """Load a validated, indexable canonical manifest from a KITTI sequence.
+
+    By default each capture retains only the union of LiDAR points projected
+    into requested cameras. Set retain_unprojected_lidar=True when a downstream
+    consumer needs the complete raw scan.
+    """
 
     sequence_root = Path(root)
     if not sequence_root.is_dir():
@@ -705,6 +729,7 @@ def load_kitti_manifest(
         elif require_lidar:
             raise FileNotFoundError(f"missing Velodyne scan: {scan_path}")
 
+        capture_frames: list[CanonicalFrame] = []
         for camera_id in camera_ids:
             image_path = image_maps[camera_id][frame_index]
             if isinstance(image_size, Mapping):
@@ -722,7 +747,7 @@ def load_kitti_manifest(
                 if lidar is not None
                 else None
             )
-            frames.append(
+            capture_frames.append(
                 CanonicalFrame(
                     timestamp=timestamp.clone(),
                     camera_id=camera_id,
@@ -743,6 +768,58 @@ def load_kitti_manifest(
                 )
             )
 
+        if lidar is not None and not retain_unprojected_lidar:
+            projection_records: list[LidarProjection] = []
+            for frame in capture_frames:
+                if frame.lidar_projection is None:
+                    raise RuntimeError(
+                        "internal KITTI frame is missing its LiDAR projection"
+                    )
+                projection_records.append(frame.lidar_projection)
+            retained_indices = torch.unique(
+                torch.cat(
+                    [
+                        projection.source_point_indices
+                        for projection in projection_records
+                    ]
+                ),
+                sorted=True,
+            )
+            compact_lidar = LidarFrame(
+                points=lidar.points.index_select(0, retained_indices),
+                reflectance=lidar.reflectance.index_select(
+                    0, retained_indices
+                ),
+                sensor_to_world=lidar.sensor_to_world,
+                source_path=lidar.source_path,
+            )
+            source_to_compact = torch.full(
+                (lidar.points.shape[0],),
+                -1,
+                dtype=torch.long,
+                device=lidar.points.device,
+            )
+            source_to_compact[retained_indices] = torch.arange(
+                retained_indices.numel(),
+                dtype=torch.long,
+                device=lidar.points.device,
+            )
+            capture_frames = [
+                replace(
+                    frame,
+                    lidar=compact_lidar,
+                    lidar_projection=replace(
+                        projection,
+                        source_point_indices=source_to_compact.index_select(
+                            0, projection.source_point_indices
+                        ),
+                    ),
+                )
+                for frame, projection in zip(
+                    capture_frames, projection_records
+                )
+            ]
+        frames.extend(capture_frames)
     actor_tracks: tuple[ActorTrack, ...] = ()
     if tracklet_path is not None:
         actor_tracks = canonicalize_kitti_tracklets(
