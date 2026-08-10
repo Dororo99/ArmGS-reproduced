@@ -352,9 +352,70 @@ class GaussianDensityPolicy:
         thresholds: DensityControlThresholds,
         *,
         schedule: DensificationSchedule | None = None,
+        actor_box_half_extents: tuple[float, float, float] | None = None,
     ) -> None:
         self.thresholds = thresholds
         self.schedule = schedule or DensificationSchedule()
+        if actor_box_half_extents is not None:
+            if len(actor_box_half_extents) != 3:
+                raise ValueError(
+                    "actor_box_half_extents must contain three values"
+                )
+            resolved_extents = tuple(
+                float(value) for value in actor_box_half_extents
+            )
+            if any(
+                not math.isfinite(value) or value <= 0.0
+                for value in resolved_extents
+            ):
+                raise ValueError(
+                    "actor_box_half_extents must be finite and positive"
+                )
+            actor_box_half_extents = resolved_extents
+        self.actor_box_half_extents = actor_box_half_extents
+
+    def _outside_actor_box_mask(
+        self,
+        module: LearnableGaussianSet,
+        *,
+        generator: torch.Generator | None,
+    ) -> Tensor:
+        """Sample StreetGS actor support and flag rows outside its local box."""
+
+        if self.actor_box_half_extents is None:
+            return torch.zeros(
+                module.count,
+                dtype=torch.bool,
+                device=module.means.device,
+            )
+        repeat_num = 2
+        scales = module.log_scales.detach().exp()
+        standard_deviations = scales[:, None, :].expand(
+            -1, repeat_num, -1
+        )
+        zero_means = torch.zeros_like(standard_deviations)
+        samples = torch.normal(
+            mean=zero_means,
+            std=standard_deviations,
+            generator=generator,
+        )
+        quaternions = normalize_quaternion(module.quaternions.detach())
+        expanded_quaternions = quaternions[:, None, :].expand(
+            -1, repeat_num, -1
+        )
+        rotated_samples = rotate_points(
+            expanded_quaternions.reshape(-1, 4),
+            samples.reshape(-1, 3),
+        ).reshape(module.count, repeat_num, 3)
+        sample_positions = rotated_samples + module.means.detach()[:, None, :]
+        half_extents = sample_positions.new_tensor(
+            self.actor_box_half_extents
+        )
+        inside = (
+            (sample_positions >= -half_extents)
+            & (sample_positions <= half_extents)
+        ).all(dim=-1).all(dim=-1)
+        return ~inside
 
     def make_plan(
         self,
@@ -436,6 +497,9 @@ class GaussianDensityPolicy:
             world_too_large = torch.zeros_like(
                 low_opacity, dtype=torch.bool
             )
+            outside_actor_box = torch.zeros_like(
+                low_opacity, dtype=torch.bool
+            )
             if prune_large and self.thresholds.max_screen_radius is not None:
                 assert stats.max_screen_radius is not None
                 screen_too_large = (
@@ -445,6 +509,10 @@ class GaussianDensityPolicy:
             if prune_large and self.thresholds.max_world_scale is not None:
                 world_too_large = (
                     maximum_scale > self.thresholds.max_world_scale
+                )
+            if prune_large and self.actor_box_half_extents is not None:
+                outside_actor_box = self._outside_actor_box_mask(
+                    module, generator=generator
                 )
 
             high_gradient = (
@@ -463,6 +531,7 @@ class GaussianDensityPolicy:
             duplicate_mask = selected_clone & ~low_opacity
             if prune_large and self.thresholds.max_world_scale is not None:
                 duplicate_mask &= ~world_too_large
+            duplicate_mask &= ~outside_actor_box
 
             split_children_too_large = torch.zeros_like(
                 selected_split, dtype=torch.bool
@@ -476,10 +545,14 @@ class GaussianDensityPolicy:
                 selected_split
                 & ~low_opacity
                 & ~split_children_too_large
+                & ~outside_actor_box
             )
 
             prune_original = (
-                low_opacity | screen_too_large | world_too_large
+                low_opacity
+                | screen_too_large
+                | world_too_large
+                | outside_actor_box
             )
             retain_mask = ~selected_split & ~prune_original
 
@@ -489,7 +562,12 @@ class GaussianDensityPolicy:
             minimum = min(self.thresholds.minimum_gaussians, module.count)
             if output_count < minimum:
                 rescue_count = minimum - output_count
-                rescue_candidates = (~retain_mask).nonzero(
+                # Actor box containment is a hard geometric invariant.  A
+                # non-reference minimum-count safeguard may rescue opacity or
+                # size-pruned rows, but never a row outside the tracking box.
+                rescue_candidates = (
+                    ~retain_mask & ~outside_actor_box
+                ).nonzero(
                     as_tuple=False
                 ).squeeze(-1)
                 rescue_order = torch.argsort(
@@ -498,7 +576,10 @@ class GaussianDensityPolicy:
                     stable=True,
                 )
                 rescued = rescue_candidates.index_select(
-                    0, rescue_order[:rescue_count]
+                    0,
+                    rescue_order[
+                        : min(rescue_count, rescue_candidates.numel())
+                    ],
                 )
                 retain_mask[rescued] = True
                 duplicate_mask[rescued] = False
@@ -1131,6 +1212,21 @@ def _frame_screen_statistics(
     return gradient_sum, observation_count, max_radius
 
 
+def _serialized_density_policy(
+    policy: GaussianDensityPolicy,
+) -> dict[str, Any]:
+    state: dict[str, Any] = {
+        "schedule": asdict(policy.schedule),
+        "thresholds": asdict(policy.thresholds),
+    }
+    # Keep generic checkpoint payloads byte-for-byte compatible with the
+    # pre-bounds controller while making enabled actor geometry strict on
+    # resume.
+    if policy.actor_box_half_extents is not None:
+        state["actor_box_half_extents"] = policy.actor_box_half_extents
+    return state
+
+
 class GsplatDensityController:
     """Trainer-facing screen-statistics and scheduled topology lifecycle.
 
@@ -1344,10 +1440,7 @@ class GsplatDensityController:
         return {
             "version": self._STATE_VERSION,
             "policies": {
-                group_id: {
-                    "schedule": asdict(policy.schedule),
-                    "thresholds": asdict(policy.thresholds),
-                }
+                group_id: _serialized_density_policy(policy)
                 for group_id, policy in self.policies.items()
             },
             "accumulators": {
@@ -1369,10 +1462,7 @@ class GsplatDensityController:
         if state.get("version") != self._STATE_VERSION:
             raise ValueError("unsupported density controller state version")
         expected_policies = {
-            group_id: {
-                "schedule": asdict(policy.schedule),
-                "thresholds": asdict(policy.thresholds),
-            }
+            group_id: _serialized_density_policy(policy)
             for group_id, policy in self.policies.items()
         }
         if strict_config and state.get("policies") != expected_policies:

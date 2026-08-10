@@ -18,7 +18,7 @@ Optional environment overrides:
   OUTPUT_DIR          Run output directory
   RESUME              Checkpoint path to resume
   ITERATIONS          Total training iterations (default: 30000)
-  CHECKPOINT_INTERVAL Checkpoint interval (default: 1000)
+  CHECKPOINT_INTERVAL Legacy compatibility setting; intermediate checkpoints are disabled
   LOG_INTERVAL        Training scalar/terminal log interval (default: 100)
   IMAGE_LOG_INTERVAL  W&B training GT/render image interval; 0 disables (default: 500)
   EVAL_INTERVAL       Held-out PSNR/SSIM/actor-PSNR interval; 0 disables periodic (default: 1000)

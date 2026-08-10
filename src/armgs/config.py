@@ -6,6 +6,7 @@ import math
 from pathlib import Path
 from typing import Any, Mapping
 
+import torch
 import yaml
 from torch import Tensor
 
@@ -181,6 +182,7 @@ def build_density_policy(
     config: dict[str, Any],
     *,
     scene_scale: float,
+    actor_box_half_extents: tuple[float, float, float] | None = None,
 ) -> GaussianDensityPolicy:
     if not math.isfinite(scene_scale) or scene_scale <= 0.0:
         raise ValueError("scene_scale must be finite and positive")
@@ -228,7 +230,11 @@ def build_density_policy(
         ),
         minimum_gaussians=int(density.get("minimum_gaussians", 0)),
     )
-    return GaussianDensityPolicy(thresholds, schedule=schedule)
+    return GaussianDensityPolicy(
+        thresholds,
+        schedule=schedule,
+        actor_box_half_extents=actor_box_half_extents,
+    )
 
 
 def build_sampler(
@@ -259,6 +265,8 @@ def build_density_controller(
     actor_box_scale: float = 1.0,
     group_scene_scales: Mapping[int, float] | None = None,
 ) -> GsplatDensityController:
+    if not math.isfinite(actor_box_scale) or actor_box_scale <= 0.0:
+        raise ValueError("actor_box_scale must be finite and positive")
     modules = {
         -1: scene.background,
         **{
@@ -287,9 +295,38 @@ def build_density_controller(
                 for actor in scene.actors
             },
         }
+    density = config["optimization"].get("densification")
+    if not isinstance(density, dict):
+        raise ValueError(
+            "configuration is missing 'optimization.densification'"
+        )
+    prune_actor_outside_box = density.get(
+        "prune_actor_outside_box", False
+    )
+    if not isinstance(prune_actor_outside_box, bool):
+        raise TypeError("prune_actor_outside_box must be a boolean")
+    actor_half_extents: dict[int, tuple[float, float, float]] = {}
+    if prune_actor_outside_box:
+        for actor in scene.actors:
+            dimensions = getattr(actor, "dimensions_lwh", None)
+            if dimensions is None:
+                raise ValueError(
+                    "prune_actor_outside_box requires actor dimensions_lwh"
+                )
+            # Waymo/StreetGS expands only the ground-plane length and width.
+            # Scene actors intentionally retain the raw tracker dimensions.
+            effective = dimensions.detach().to(
+                device="cpu", dtype=torch.float64
+            ).clone()
+            effective[:2] *= actor_box_scale
+            actor_half_extents[actor.actor_id] = tuple(
+                float(value) for value in (effective * 0.5).tolist()
+            )
     policy = {
         group_id: build_density_policy(
-            config, scene_scale=resolved_scales[group_id]
+            config,
+            scene_scale=resolved_scales[group_id],
+            actor_box_half_extents=actor_half_extents.get(group_id),
         )
         for group_id in modules
     }

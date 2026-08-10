@@ -356,7 +356,17 @@ def test_trainer_registers_every_parameter_group_and_resumes_exactly() -> None:
         "actor_deformation",
         "sky",
     }
+    assert trainer.group_lr_scheduler is None
     assert trainer.optimizer.defaults["eps"] == 1.0e-15
+    fixed_groups = {
+        group["name"]: group for group in trainer.optimizer.param_groups
+    }
+    assert fixed_groups["actor_pose"]["lr"] == pytest.approx(
+        config["optimization"]["learning_rates"]["actor_pose"]
+    )
+    assert fixed_groups["sky"]["lr"] == pytest.approx(
+        config["optimization"]["learning_rates"]["sky"]
+    )
     mean_groups = {
         group["name"]: group for group in trainer.optimizer.param_groups
         if str(group["name"]).startswith("means/")
@@ -401,6 +411,196 @@ def test_trainer_registers_every_parameter_group_and_resumes_exactly() -> None:
         expected = trainer.renderer(make_view()).rgb
         actual = restored.renderer(make_view()).rgb
     torch.testing.assert_close(actual, expected)
+
+
+def test_streetgs_pose_and_sky_lr_schedules_use_global_one_based_step() -> None:
+    config_path = (
+        Path(__file__).resolve().parents[1]
+        / "configs"
+        / "armgs_waymo_streetgs.yaml"
+    )
+    config = load_config(config_path)
+    renderer, _ = make_renderer(sh_degree=1)
+    trainer = ArmGSTrainer.from_config(renderer, build_loss(config), config)
+    scheduler = trainer.group_lr_scheduler
+    assert scheduler is not None
+
+    groups = {
+        group["name"]: group for group in trainer.optimizer.param_groups
+    }
+    assert "actor_pose" not in groups
+    assert {
+        "actor_pose_translation",
+        "actor_pose_rotation",
+        "sky",
+    } <= groups.keys()
+    assert groups["actor_pose_translation"]["params"] == [
+        renderer.scene.actors[0].trajectory.translations
+    ]
+    assert groups["actor_pose_rotation"]["params"] == [
+        renderer.scene.actors[0].trajectory.quaternions
+    ]
+
+    assert scheduler.learning_rate_at(
+        "actor_pose_translation", 2_999
+    ) == 0.0
+    translation_at_boundary = 0.005 * (0.00005 / 0.005) ** (
+        3_000 / 30_000
+    )
+    rotation_at_boundary = 0.001 * (0.00001 / 0.001) ** (
+        3_000 / 30_000
+    )
+    assert scheduler.learning_rate_at(
+        "actor_pose_translation", 3_000
+    ) == pytest.approx(translation_at_boundary)
+    assert scheduler.learning_rate_at(
+        "actor_pose_rotation", 3_000
+    ) == pytest.approx(rotation_at_boundary)
+    assert scheduler.learning_rate_at(
+        "actor_pose_translation", 30_000
+    ) == pytest.approx(0.00005)
+    assert scheduler.learning_rate_at(
+        "actor_pose_rotation", 30_000
+    ) == pytest.approx(0.00001)
+    assert scheduler.learning_rate_at("sky", 0) == pytest.approx(0.01)
+    assert scheduler.learning_rate_at("sky", 30_000) == pytest.approx(
+        0.0001
+    )
+
+    with torch.no_grad():
+        reference = renderer(make_view())
+    assert reference.actor_alpha is not None
+    batch = ArmGSTrainingBatch(
+        view=make_view(),
+        target_rgb=torch.full_like(reference.rgb, 0.25),
+        lidar_depth=reference.depth + 0.5,
+        target_sky_mask=torch.zeros_like(
+            reference.non_sky_accumulated_alpha
+        ),
+        actor_bbox_mask=torch.ones_like(
+            reference.actor_alpha, dtype=torch.bool
+        ),
+    )
+    observed_lrs: list[dict[str, float]] = []
+
+    def capture_lrs(
+        _module: torch.nn.Module, _inputs: tuple[object, ...]
+    ) -> None:
+        observed_lrs.append(
+            {
+                name: float(groups[name]["lr"])
+                for name in (
+                    "actor_pose_translation",
+                    "actor_pose_rotation",
+                    "sky",
+                )
+            }
+        )
+
+    hook = renderer.register_forward_pre_hook(capture_lrs)
+    trainer.step = 2_998
+    trainer.train_step(batch)
+    trainer.train_step(batch)
+    hook.remove()
+
+    assert observed_lrs[0]["actor_pose_translation"] == 0.0
+    assert observed_lrs[0]["actor_pose_rotation"] == 0.0
+    assert observed_lrs[1]["actor_pose_translation"] == pytest.approx(
+        translation_at_boundary
+    )
+    assert observed_lrs[1]["actor_pose_rotation"] == pytest.approx(
+        rotation_at_boundary
+    )
+    assert observed_lrs[1]["sky"] == pytest.approx(
+        0.01 * (0.0001 / 0.01) ** (3_000 / 30_000)
+    )
+
+    state = trainer.state_dict()
+    restored_renderer, _ = make_renderer(sh_degree=1)
+    restored = ArmGSTrainer.from_config(
+        restored_renderer, build_loss(config), config
+    )
+    restored.load_state_dict(state)
+    restored_groups = {
+        group["name"]: group for group in restored.optimizer.param_groups
+    }
+    assert restored.step == 3_000
+    for name in (
+        "actor_pose_translation",
+        "actor_pose_rotation",
+        "sky",
+    ):
+        assert restored_groups[name]["lr"] == pytest.approx(groups[name]["lr"])
+
+    mismatched = load_config(config_path)
+    mismatched["optimization"]["learning_rate_schedules"][
+        "sky"
+    ]["final"] = 0.0002
+    mismatched_renderer, _ = make_renderer(sh_degree=1)
+    mismatched_trainer = ArmGSTrainer.from_config(
+        mismatched_renderer, build_loss(mismatched), mismatched
+    )
+    with pytest.raises(ValueError, match="LR schedules differ"):
+        mismatched_trainer.load_state_dict(state)
+
+
+def test_trainer_activates_foreground_at_one_based_boundary_and_checks_resume() -> None:
+    config_path = (
+        Path(__file__).resolve().parents[1] / "configs" / "armgs_default.yaml"
+    )
+    config = load_config(config_path)
+    config["loss"]["foreground_start_iteration"] = 2
+    renderer, _ = make_renderer()
+    trainer = ArmGSTrainer.from_config(
+        renderer,
+        ArmGSLoss(
+            lambda_ssim=0.0,
+            lambda_depth=0.0,
+            lambda_sky=0.0,
+            lambda_foreground=1.0,
+            require_auxiliary=True,
+        ),
+        config,
+    )
+    with torch.no_grad():
+        reference = renderer(make_view())
+    assert reference.actor_alpha is not None
+    batch = ArmGSTrainingBatch(
+        view=make_view(),
+        target_rgb=torch.full_like(reference.rgb, 0.25),
+        actor_bbox_mask=torch.ones_like(
+            reference.actor_alpha, dtype=torch.bool
+        ),
+    )
+
+    before = trainer.train_step(batch)
+    assert before.step == 0
+    torch.testing.assert_close(before.losses.foreground, torch.tensor(0.0))
+
+    at_boundary = trainer.train_step(batch)
+    assert at_boundary.step == 1
+    assert at_boundary.losses.foreground > 0.0
+
+    state = trainer.state_dict()
+    assert state["foreground_start_iteration"] == 2
+    mismatched_config = load_config(config_path)
+    mismatched_config["loss"]["foreground_start_iteration"] = 3
+    restored_renderer, _ = make_renderer()
+    restored = ArmGSTrainer.from_config(
+        restored_renderer,
+        ArmGSLoss(
+            lambda_ssim=0.0,
+            lambda_depth=0.0,
+            lambda_sky=0.0,
+            lambda_foreground=1.0,
+            require_auxiliary=True,
+        ),
+        mismatched_config,
+    )
+    with pytest.raises(
+        ValueError, match="foreground start iteration differs"
+    ):
+        restored.load_state_dict(state)
 
 
 def test_trainer_activates_sh_bands_every_thousand_steps() -> None:

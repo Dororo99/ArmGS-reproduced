@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from pathlib import Path
 from typing import Sequence
 
@@ -12,6 +13,19 @@ from torch import Tensor
 from .structures import GaussianSet
 
 _SH_C0 = 0.28209479177387814
+
+
+@dataclass(frozen=True)
+class StreetGSBackgroundPreprocessingResult:
+    """StreetGS-compatible world-space background initialization data."""
+
+    points: Tensor
+    colors: Tensor
+    lidar_point_count: int
+    sfm_input_point_count: int
+    sfm_retained_point_count: int
+    lidar_aabb_center: Tensor
+    lidar_aabb_half_diagonal: Tensor
 
 
 @dataclass(frozen=True)
@@ -330,6 +344,190 @@ def merge_colored_point_clouds(
     return voxel_downsample(merged_points, merged_colors, voxel_size)
 
 
+@torch.no_grad()
+def preprocess_streetgs_waymo_background(
+    lidar_points: Tensor,
+    lidar_colors: Tensor,
+    sfm_points: Tensor | None = None,
+    sfm_colors: Tensor | None = None,
+    *,
+    camera_centers: Tensor | None = None,
+    voxel_size: float = 0.15,
+    radius_outlier_nb_points: int = 10,
+    radius_outlier_radius: float = 0.5,
+    sfm_extent_multiplier: float = 2.0,
+    filter_sfm_near_or_below_cameras: bool = False,
+    camera_extent: float = 20.0,
+) -> StreetGSBackgroundPreprocessingResult:
+    """Prepare the Waymo background in the official StreetGS order.
+
+    The LiDAR cloud is first processed by Open3D's color-aware
+    ``voxel_down_sample`` and ``remove_radius_outlier`` operations. Its AABB
+    center and half-diagonal define the SfM acceptance sphere. SfM points
+    strictly inside ``sfm_extent_multiplier * half_diagonal`` are appended to
+    the filtered LiDAR cloud without another voxel operation.
+
+    The optional camera filter reproduces StreetGS's ``filter_colmap`` branch:
+    it removes an SfM point when it is within ``camera_extent`` of any camera
+    or below any camera along Waymo's world Z axis. Official Waymo validation
+    configs leave this branch disabled, hence the ``False`` default.
+
+    Open3D is imported lazily so it remains a Waymo preprocessing dependency,
+    rather than a requirement for importing the ArmGS core package.
+    """
+
+    def _require_positive(value: float, name: str) -> float:
+        if isinstance(value, bool):
+            raise ValueError(f"{name} must be finite and positive")
+        try:
+            converted = float(value)
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"{name} must be finite and positive"
+            ) from None
+        if not math.isfinite(converted) or converted <= 0:
+            raise ValueError(f"{name} must be finite and positive")
+        return converted
+
+    if lidar_points.device != lidar_colors.device:
+        raise ValueError("LiDAR points and colors must share a device")
+    if lidar_points.dtype != lidar_colors.dtype:
+        raise ValueError("LiDAR points and colors must share a dtype")
+    lidar_points, lidar_colors = _validated_points_and_colors(
+        lidar_points, lidar_colors
+    )
+    voxel_size = _require_positive(voxel_size, "voxel_size")
+    radius_outlier_radius = _require_positive(
+        radius_outlier_radius, "radius_outlier_radius"
+    )
+    sfm_extent_multiplier = _require_positive(
+        sfm_extent_multiplier, "sfm_extent_multiplier"
+    )
+    camera_extent = _require_positive(camera_extent, "camera_extent")
+    if (
+        isinstance(radius_outlier_nb_points, bool)
+        or not isinstance(radius_outlier_nb_points, int)
+        or radius_outlier_nb_points <= 0
+    ):
+        raise ValueError("radius_outlier_nb_points must be a positive integer")
+    if not isinstance(filter_sfm_near_or_below_cameras, bool):
+        raise ValueError(
+            "filter_sfm_near_or_below_cameras must be boolean"
+        )
+    if (sfm_points is None) != (sfm_colors is None):
+        raise ValueError("sfm_points and sfm_colors must be provided together")
+
+    try:
+        import numpy as np
+        import open3d as o3d
+    except ImportError as error:
+        raise ImportError(
+            "StreetGS Waymo background preprocessing requires Open3D"
+        ) from error
+
+    point_cloud = o3d.geometry.PointCloud()
+    point_cloud.points = o3d.utility.Vector3dVector(
+        lidar_points.detach().to(device="cpu", dtype=torch.float64).numpy()
+    )
+    point_cloud.colors = o3d.utility.Vector3dVector(
+        lidar_colors.detach().to(device="cpu", dtype=torch.float64).numpy()
+    )
+    point_cloud = point_cloud.voxel_down_sample(voxel_size=voxel_size)
+    point_cloud, _ = point_cloud.remove_radius_outlier(
+        nb_points=radius_outlier_nb_points,
+        radius=radius_outlier_radius,
+    )
+    filtered_lidar_numpy = np.asarray(point_cloud.points)
+    filtered_colors_numpy = np.asarray(point_cloud.colors)
+    if filtered_lidar_numpy.shape != filtered_colors_numpy.shape:
+        raise RuntimeError(
+            "Open3D returned mismatched LiDAR point and color arrays"
+        )
+    if (
+        filtered_lidar_numpy.ndim != 2
+        or filtered_lidar_numpy.shape[1:] != (3,)
+        or filtered_lidar_numpy.shape[0] == 0
+    ):
+        raise ValueError(
+            "StreetGS LiDAR preprocessing removed every background point"
+        )
+
+    # Copy the Open3D-owned buffers before its point cloud goes out of scope.
+    filtered_lidar = torch.from_numpy(
+        np.array(filtered_lidar_numpy, copy=True)
+    ).to(device=lidar_points.device, dtype=lidar_points.dtype)
+    filtered_colors = torch.from_numpy(
+        np.array(filtered_colors_numpy, copy=True)
+    ).to(device=lidar_colors.device, dtype=lidar_colors.dtype)
+    filtered_lidar, filtered_colors = _validated_points_and_colors(
+        filtered_lidar, filtered_colors
+    )
+
+    minimum = filtered_lidar.amin(dim=0)
+    maximum = filtered_lidar.amax(dim=0)
+    lidar_aabb_center = (minimum + maximum) * 0.5
+    lidar_aabb_half_diagonal = torch.linalg.vector_norm(
+        maximum - minimum
+    ) * 0.5
+
+    sfm_input_point_count = 0
+    sfm_retained_point_count = 0
+    merged_points = filtered_lidar
+    merged_colors = filtered_colors
+    if sfm_points is not None and sfm_colors is not None:
+        sfm_points, sfm_colors = _validated_points_and_colors(
+            sfm_points, sfm_colors
+        )
+        sfm_points = sfm_points.to(filtered_lidar)
+        sfm_colors = sfm_colors.to(filtered_colors)
+        sfm_input_point_count = sfm_points.shape[0]
+        keep = torch.linalg.vector_norm(
+            sfm_points - lidar_aabb_center[None], dim=-1
+        ) < sfm_extent_multiplier * lidar_aabb_half_diagonal
+
+        if filter_sfm_near_or_below_cameras:
+            if camera_centers is None:
+                raise ValueError(
+                    "camera_centers are required when the camera SfM filter "
+                    "is enabled"
+                )
+            if (
+                camera_centers.ndim != 2
+                or camera_centers.shape[-1] != 3
+                or camera_centers.shape[0] == 0
+                or not torch.isfinite(camera_centers).all()
+            ):
+                raise ValueError(
+                    "camera_centers must have finite, non-empty shape [C,3]"
+                )
+            camera_centers = camera_centers.to(sfm_points)
+            distances = torch.linalg.vector_norm(
+                sfm_points[:, None] - camera_centers[None], dim=-1
+            )
+            near_any_camera = (distances < camera_extent).any(dim=-1)
+            below_any_camera = (
+                sfm_points[:, None, 2] < camera_centers[None, :, 2]
+            ).any(dim=-1)
+            keep &= ~(near_any_camera | below_any_camera)
+
+        retained_sfm_points = sfm_points[keep]
+        retained_sfm_colors = sfm_colors[keep]
+        sfm_retained_point_count = retained_sfm_points.shape[0]
+        # StreetGS concatenates the modalities here; there is no second voxel.
+        merged_points = torch.cat((filtered_lidar, retained_sfm_points), dim=0)
+        merged_colors = torch.cat((filtered_colors, retained_sfm_colors), dim=0)
+
+    return StreetGSBackgroundPreprocessingResult(
+        points=merged_points,
+        colors=merged_colors,
+        lidar_point_count=filtered_lidar.shape[0],
+        sfm_input_point_count=sfm_input_point_count,
+        sfm_retained_point_count=sfm_retained_point_count,
+        lidar_aabb_center=lidar_aabb_center,
+        lidar_aabb_half_diagonal=lidar_aabb_half_diagonal,
+    )
+
+
 def initialize_gaussians_from_points(
     points: Tensor,
     colors: Tensor | None = None,
@@ -463,10 +661,12 @@ def load_colmap_points3d_text(path: str | Path) -> tuple[Tensor, Tensor]:
 
 __all__ = [
     "GaussianInitializationConfig",
+    "StreetGSBackgroundPreprocessingResult",
     "estimate_knn_isotropic_scales",
     "initialize_gaussians_from_points",
     "load_colmap_points3d_text",
     "merge_colored_point_clouds",
+    "preprocess_streetgs_waymo_background",
     "voxel_downsample",
     "world_points_to_actor_local",
 ]

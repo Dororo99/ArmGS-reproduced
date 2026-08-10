@@ -9,7 +9,7 @@ nuScenes scene-0061 launcher는 기본적으로 `CamoSplat/ArmGS-nuScenes`에
 | training scalar | `LOG_INTERVAL` | 100 | 직전 구간의 training 통계를 한 번 기록 |
 | training preview | `IMAGE_LOG_INTERVAL` | 500 | 현재 training batch의 `GT | render` 한 장 기록; `0`은 비활성화 |
 | held-out 평가 | `EVAL_INTERVAL` | 1,000 | eval split 전체 metric 및 카메라별 preview 기록; `0`은 periodic만 비활성화 |
-| local checkpoint | `CHECKPOINT_INTERVAL` | 1,000 | W&B와 무관하게 로컬 `.pt` 저장 |
+| local checkpoint | `CHECKPOINT_INTERVAL` | 1,000 | 호환성 옵션; 학습 종료 시 `final.pt`만 저장 |
 
 `EVAL_AT_END=1`이 기본이므로 `EVAL_INTERVAL=0`이어도 학습 종료 시 held-out
 평가는 한 번 실행한다. 반대로 training preview는 final step이 500의 배수가
@@ -96,7 +96,7 @@ W&B run ID를 결정한다.
 OUTPUT_DIR=/path/to/run WANDB_RUN_NAME=scene0061-main \
   bash scripts/train_nuscenes_scene_0061.sh 0
 
-OUTPUT_DIR=/path/to/run RESUME=/path/to/run/checkpoints/step_00010000.pt \
+OUTPUT_DIR=/path/to/run RESUME=/path/to/run/checkpoints/final.pt \
   WANDB_RUN_NAME=scene0061-main \
   bash scripts/train_nuscenes_scene_0061.sh 0
 ~~~

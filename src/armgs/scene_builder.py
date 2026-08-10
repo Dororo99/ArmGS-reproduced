@@ -184,10 +184,14 @@ def collect_colored_lidar_point_clouds(
         assigned = torch.zeros(world.shape[0], dtype=torch.bool, device=world.device)
 
         for track, sample in samples_by_frame.get(frame.frame_index, ()):
+            # StreetGS' Waymo box_scale expands only the ground-plane axes;
+            # tracker height remains unchanged.
+            effective_dimensions = track.dimensions_lwh.to(world).clone()
+            effective_dimensions[:2] *= actor_box_scale
             local, inside = world_points_to_actor_local(
                 world,
                 _actor_to_world(sample, world),
-                box_dimensions=track.dimensions_lwh.to(world) * actor_box_scale,
+                box_dimensions=effective_dimensions,
             )
             take = inside & ~assigned
             if not take.any():
@@ -247,12 +251,19 @@ def build_scene_from_point_clouds(
     point_clouds: CanonicalScenePointClouds,
     *,
     initialization: GaussianInitializationConfig | None = None,
+    actor_initialization: GaussianInitializationConfig | None = None,
     sky: ExplicitCubemapSky | None = None,
     require_all_actor_points: bool = True,
 ) -> CompositeGaussianScene:
-    """Initialize background and tracked actor modules from colored points."""
+    """Initialize background and tracked actor modules from colored points.
+
+    By default actors inherit ``initialization``. Dataset adapters may pass a
+    separate policy when their reference implementation treats actor points
+    differently from the static background (for example, no voxel fusion).
+    """
 
     initialization = initialization or GaussianInitializationConfig()
+    actor_initialization = actor_initialization or initialization
     background = LearnableGaussianSet(
         initialize_gaussians_from_points(
             point_clouds.background.points,
@@ -276,7 +287,7 @@ def build_scene_from_point_clouds(
             initialize_gaussians_from_points(
                 cloud.points.to(reference),
                 cloud.colors.to(reference),
-                config=initialization,
+                config=actor_initialization,
             )
         )
         actors.append(

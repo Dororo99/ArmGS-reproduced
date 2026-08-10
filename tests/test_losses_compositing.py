@@ -40,6 +40,57 @@ def test_strict_paper_loss_rejects_missing_auxiliaries() -> None:
         ArmGSLoss(require_auxiliary=True)(image, image)
 
 
+def test_inactive_foreground_is_not_required_or_differentiated() -> None:
+    prediction = torch.zeros(1, 4, 5, 3, requires_grad=True)
+    target = torch.zeros_like(prediction)
+    actor_alpha = torch.full(
+        (1, 4, 5, 1), 0.2, requires_grad=True
+    )
+    loss = ArmGSLoss(
+        lambda_ssim=0.0,
+        lambda_depth=0.0,
+        lambda_sky=0.0,
+        lambda_foreground=1.0,
+        require_auxiliary=True,
+    )
+
+    inactive = loss(
+        prediction,
+        target,
+        actor_alpha=actor_alpha,
+        actor_bbox_mask=torch.ones_like(actor_alpha, dtype=torch.bool),
+        foreground_active=False,
+    )
+    inactive.total.backward()
+
+    torch.testing.assert_close(inactive.foreground, torch.tensor(0.0))
+    assert actor_alpha.grad is None
+
+    active_alpha = actor_alpha.detach().requires_grad_()
+    active = loss(
+        prediction.detach(),
+        target,
+        actor_alpha=active_alpha,
+        actor_bbox_mask=torch.ones_like(active_alpha, dtype=torch.bool),
+        foreground_active=True,
+    )
+    active.total.backward()
+
+    assert active.foreground > 0.0
+    assert active_alpha.grad is not None
+    assert torch.count_nonzero(active_alpha.grad) > 0
+
+
+def test_inactive_foreground_keeps_other_strict_auxiliaries_required() -> None:
+    image = torch.rand(8, 9, 3)
+    with pytest.raises(ValueError, match=r"depth, sky$"):
+        ArmGSLoss(require_auxiliary=True)(
+            image,
+            image,
+            foreground_active=False,
+        )
+
+
 def test_empty_invalid_depth_mask_is_finite_zero() -> None:
     rendered = torch.tensor([float("nan")])
     target = torch.tensor([float("nan")])

@@ -223,7 +223,10 @@ class ArmGSLoss(nn.Module):
         sky_valid_mask: Tensor | None = None,
         actor_alpha: Tensor | None = None,
         actor_bbox_mask: Tensor | None = None,
+        foreground_active: bool = True,
     ) -> LossBreakdown:
+        if not isinstance(foreground_active, bool):
+            raise TypeError("foreground_active must be a boolean")
         rgb = rgb_l1_loss(prediction_rgb, target_rgb)
         ssim = 1.0 - structural_similarity(
             prediction_rgb,
@@ -243,7 +246,11 @@ class ArmGSLoss(nn.Module):
                 non_sky_accumulated_alpha is None or target_sky_mask is None
             ):
                 missing.append("sky")
-            if self.lambda_foreground > 0.0 and actor_alpha is None:
+            if (
+                foreground_active
+                and self.lambda_foreground > 0.0
+                and actor_alpha is None
+            ):
                 missing.append("foreground")
             if missing:
                 raise ValueError("missing required auxiliary loss inputs: " + ", ".join(missing))
@@ -269,13 +276,16 @@ class ArmGSLoss(nn.Module):
             if non_sky_accumulated_alpha is not None and target_sky_mask is not None
             else zero
         )
-        if actor_bbox_mask is not None and actor_alpha is None:
-            raise ValueError("actor_bbox_mask requires actor_alpha")
-        foreground = (
-            foreground_entropy_loss(actor_alpha, actor_bbox_mask)
-            if actor_alpha is not None
-            else zero
-        )
+        if foreground_active:
+            if actor_bbox_mask is not None and actor_alpha is None:
+                raise ValueError("actor_bbox_mask requires actor_alpha")
+            foreground = (
+                foreground_entropy_loss(actor_alpha, actor_bbox_mask)
+                if actor_alpha is not None
+                else zero
+            )
+        else:
+            foreground = zero
 
         total = (
             (1.0 - self.lambda_ssim) * rgb

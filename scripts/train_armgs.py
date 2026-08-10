@@ -210,6 +210,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--checkpoint-interval",
         type=_positive_int,
         default=1000,
+        help=(
+            "legacy compatibility option; intermediate checkpoints are "
+            "disabled and only final.pt is written"
+        ),
     )
     parser.add_argument("--log-interval", type=_positive_int, default=100)
     return parser.parse_args(argv)
@@ -585,17 +589,42 @@ _LOSS_TELEMETRY_FIELDS = (
     ("train/foreground_loss", "foreground"),
 )
 
+_PSNR_MSE_FLOOR = 1.0e-10
+
 
 def _accumulate_loss_telemetry(
-    sums: dict[str, torch.Tensor], output: Any
+    sums: dict[str, torch.Tensor], output: Any, batch: Any
 ) -> None:
-    """Accumulate detached losses without synchronizing CUDA every step."""
+    """Accumulate detached losses and train-view quality on the active device."""
 
     for metric, attribute in _LOSS_TELEMETRY_FIELDS:
         value = getattr(output.losses, attribute).detach()
         if value.numel() != 1:
             raise ValueError(f"training loss {attribute!r} must be scalar")
         value = value.reshape(()).to(dtype=torch.float64)
+        if metric in sums:
+            sums[metric].add_(value)
+        else:
+            sums[metric] = value.clone()
+
+    rendered_rgb = output.rendering.rgb.detach()
+    target_rgb = batch.target_rgb.detach().to(rendered_rgb)
+    if rendered_rgb.shape != target_rgb.shape:
+        raise ValueError(
+            "rendered and target RGB must have matching shapes for telemetry"
+        )
+    if rendered_rgb.numel() == 0:
+        raise ValueError("training RGB tensors must not be empty")
+
+    squared_error = (rendered_rgb - target_rgb).square()
+    mse = squared_error.mean(dtype=torch.float64)
+    quality_values = {
+        "train/psnr": -10.0
+        * torch.log10(mse.clamp_min(_PSNR_MSE_FLOOR)),
+        "train/ssim": 1.0
+        - output.losses.ssim.detach().reshape(()).to(dtype=torch.float64),
+    }
+    for metric, value in quality_values.items():
         if metric in sums:
             sums[metric].add_(value)
         else:
@@ -751,7 +780,7 @@ def train_until(
     device: torch.device | str,
     checkpoint_interval: int,
     log_interval: int,
-    checkpoint_callback: Any,
+    checkpoint_callback: Any | None = None,
     log_callback: Any | None = None,
     log_payload_factory: Any | None = None,
     payload_interval: int | None = None,
@@ -828,7 +857,7 @@ def train_until(
                 torch.cuda.synchronize(runtime_device)
             interval_seconds += time.perf_counter() - step_started
             interval_steps += 1
-            _accumulate_loss_telemetry(loss_sums, output)
+            _accumulate_loss_telemetry(loss_sums, output, batch)
             density_results_available = (
                 _accumulate_density_telemetry(density_totals, output)
                 or density_results_available
@@ -867,7 +896,7 @@ def train_until(
                 record = {**callback_base, **dict(extra_payload)}
             if record is not None and log_callback is not None:
                 log_callback(record)
-            if trainer.step % checkpoint_interval == 0:
+            if checkpoint_callback is not None and trainer.step % checkpoint_interval == 0:
                 checkpoint_callback(trainer.step)
             if completed_step_callback is not None:
                 completed_step_callback(trainer.step)
@@ -1036,14 +1065,6 @@ def run(args: argparse.Namespace) -> Path:
         json.dumps(run_metadata, indent=2, sort_keys=True) + "\n",
     )
 
-    def checkpoint_callback(step: int) -> None:
-        save_training_checkpoint(
-            checkpoints / f"step_{step:08d}.pt",
-            trainer,
-            config,
-            run_metadata,
-        )
-
     train_until(
         trainer,
         split.train_manifest,
@@ -1051,7 +1072,7 @@ def run(args: argparse.Namespace) -> Path:
         device=device,
         checkpoint_interval=args.checkpoint_interval,
         log_interval=args.log_interval,
-        checkpoint_callback=checkpoint_callback,
+        checkpoint_callback=None,
     )
     final_path = checkpoints / "final.pt"
     save_training_checkpoint(final_path, trainer, config, run_metadata)

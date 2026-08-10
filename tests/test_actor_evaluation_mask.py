@@ -187,6 +187,38 @@ def test_opengl_axis_conversion_and_wxyz_rotation(tmp_path: Path) -> None:
     )
 
 
+def test_box_scale_expands_planar_axes_without_scaling_height(
+    tmp_path: Path,
+) -> None:
+    frame = _frame(tmp_path)
+    raw = _track(
+        actor_id=0,
+        frame_index=3,
+        translation=(0.0, 0.0, 10.0),
+        dimensions=(2.0, 2.0, 2.0),
+    )
+    planar_reference = _track(
+        actor_id=1,
+        frame_index=3,
+        translation=(0.0, 0.0, 10.0),
+        dimensions=(4.0, 4.0, 2.0),
+    )
+    fully_scaled = _track(
+        actor_id=2,
+        frame_index=3,
+        translation=(0.0, 0.0, 10.0),
+        dimensions=(4.0, 4.0, 4.0),
+    )
+
+    scaled = project_actor_boxes_to_mask(frame, (raw,), box_scale=2.0)
+    torch.testing.assert_close(
+        scaled, project_actor_boxes_to_mask(frame, (planar_reference,))
+    )
+    assert not torch.equal(
+        scaled, project_actor_boxes_to_mask(frame, (fully_scaled,))
+    )
+
+
 def test_empty_tracks_and_fully_offscreen_box_are_empty(tmp_path: Path) -> None:
     frame = _frame(tmp_path)
     offscreen = _track(

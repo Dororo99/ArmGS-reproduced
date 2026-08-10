@@ -2,10 +2,12 @@ from __future__ import annotations
 
 from dataclasses import replace
 import math
+from types import SimpleNamespace
 
 import pytest
 import torch
 
+from armgs.config import build_density_controller
 from armgs.density import (
     DensificationSchedule,
     DensityControlThresholds,
@@ -231,6 +233,135 @@ def test_large_pruning_starts_after_3000_and_follows_densify_then_prune() -> Non
         after_boundary.split_indices, torch.tensor([1])
     )
     assert after_boundary.pruned_count == 2
+
+
+def test_actor_box_pruning_samples_rotated_support_after_large_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = LearnableGaussianSet(
+        GaussianSet(
+            means=torch.zeros(2, 3),
+            # The first non-unit quaternion normalizes to a 90-degree z turn.
+            quaternions=torch.tensor(
+                [
+                    [2.0**0.5, 0.0, 0.0, 2.0**0.5],
+                    [1.0, 0.0, 0.0, 0.0],
+                ]
+            ),
+            scales=torch.full((2, 3), 0.1),
+            opacities=torch.full((2, 1), 0.8),
+            sh_coefficients=torch.zeros(2, 1, 3),
+        )
+    )
+    policy = GaussianDensityPolicy(
+        replace(
+            thresholds(),
+            position_gradient_threshold=10.0,
+            prune_opacity_threshold=0.0,
+            prune_large_after_step=3_000,
+        ),
+        actor_box_half_extents=(2.0, 0.5, 2.0),
+    )
+    stats = GaussianDensityStats(torch.zeros(module.count))
+    calls = 0
+
+    def fixed_normal(
+        mean: torch.Tensor,
+        std: torch.Tensor,
+        *,
+        generator: torch.Generator | None = None,
+    ) -> torch.Tensor:
+        nonlocal calls
+        calls += 1
+        assert mean.shape == std.shape == (2, 2, 3)
+        assert generator is not None
+        samples = torch.zeros_like(mean)
+        # One of the first Gaussian's two support samples rotates from +x to
+        # +y, crossing the y half-extent. Every sample of row one stays in.
+        samples[0, 1, 0] = 1.0
+        return samples
+
+    monkeypatch.setattr(torch, "normal", fixed_normal)
+    boundary = policy.make_plan(
+        module,
+        stats,
+        step=3_000,
+        generator=torch.Generator().manual_seed(4),
+    )
+    torch.testing.assert_close(
+        boundary.retain_indices, torch.tensor([0, 1])
+    )
+    assert calls == 0
+
+    after = policy.make_plan(
+        module,
+        stats,
+        step=3_100,
+        generator=torch.Generator().manual_seed(4),
+    )
+    torch.testing.assert_close(after.retain_indices, torch.tensor([1]))
+    assert after.pruned_count == 1
+    assert calls == 1
+
+    background_policy = GaussianDensityPolicy(policy.thresholds)
+    background = background_policy.make_plan(
+        module,
+        stats,
+        step=3_100,
+        generator=torch.Generator().manual_seed(4),
+    )
+    torch.testing.assert_close(
+        background.retain_indices, torch.tensor([0, 1])
+    )
+    assert calls == 1
+
+
+def test_density_controller_uses_planar_scaled_actor_bounds_only() -> None:
+    config = {
+        "optimization": {
+            "densification": {
+                "start_iteration": 500,
+                "end_iteration": 15_000,
+                "interval": 100,
+                "position_gradient_threshold": 0.0002,
+                "split_scale_fraction_of_scene": 0.01,
+                "prune_opacity_threshold": 0.005,
+                "split_children": 2,
+                "split_scale_reduction": 1.6,
+                "opacity_reset_value": 0.01,
+                "prune_actor_outside_box": True,
+            }
+        }
+    }
+    background = make_module()
+    actor_gaussians = make_module()
+    actor = SimpleNamespace(
+        actor_id=7,
+        gaussians=actor_gaussians,
+        dimensions_lwh=torch.tensor([4.0, 2.0, 1.5]),
+    )
+    scene = SimpleNamespace(background=background, actors=[actor])
+    controller = build_density_controller(
+        config,
+        scene,
+        scene_scale=20.0,
+        actor_box_scale=2.0,
+        group_scene_scales={-1: 20.0, 7: 3.0},
+    )
+
+    assert controller.policy_for(-1).actor_box_half_extents is None
+    assert controller.policy_for(7).actor_box_half_extents == (
+        4.0,
+        2.0,
+        0.75,
+    )
+    state = controller.state_dict()
+    assert "actor_box_half_extents" not in state["policies"][-1]
+    assert state["policies"][7]["actor_box_half_extents"] == (
+        4.0,
+        2.0,
+        0.75,
+    )
 
 
 def test_reset_is_capped_and_disabled_at_densification_endpoint() -> None:

@@ -8,7 +8,7 @@ import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, NamedTuple
 
 import pytest
 import torch
@@ -456,6 +456,22 @@ def test_checkpoint_loader_forwards_map_location(
     assert captured["weights_only"] is True
 
 
+class _LoopBatch(NamedTuple):
+    frame: Any
+    row: int
+    device: str
+    target_rgb: torch.Tensor
+
+
+def _loop_batch(frame: Any, row: int, device: Any) -> _LoopBatch:
+    return _LoopBatch(
+        frame=frame,
+        row=row,
+        device=str(device),
+        target_rgb=torch.zeros((1, 1, 1, 3), dtype=torch.float32),
+    )
+
+
 class _LoopTrainer:
     def __init__(self, *, step: int = 0, sampler: StatefulShuffleSampler | None = None):
         self.step = step
@@ -484,12 +500,46 @@ class _LoopTrainer:
         losses = SimpleNamespace(
             total=scalar,
             rgb=scalar,
-            ssim=scalar,
+            ssim=scalar / 10.0,
             depth=scalar,
             sky=scalar,
             foreground=scalar,
         )
-        return SimpleNamespace(losses=losses)
+        rendering = SimpleNamespace(
+            rgb=torch.full_like(batch.target_rgb, self.step / 10.0)
+        )
+        return SimpleNamespace(losses=losses, rendering=rendering)
+
+
+def test_loss_telemetry_accumulates_exact_psnr_and_ssim_on_device() -> None:
+    sums: dict[str, torch.Tensor] = {}
+    output = SimpleNamespace(
+        losses=SimpleNamespace(
+            total=torch.tensor(1.0),
+            rgb=torch.tensor(2.0),
+            ssim=torch.tensor(0.25),
+            depth=torch.tensor(3.0),
+            sky=torch.tensor(4.0),
+            foreground=torch.tensor(5.0),
+        ),
+        rendering=SimpleNamespace(
+            rgb=torch.full((1, 2, 2, 3), 0.5, dtype=torch.float64)
+        ),
+    )
+    batch = SimpleNamespace(
+        target_rgb=torch.zeros((1, 2, 2, 3), dtype=torch.float64)
+    )
+
+    training_cli._accumulate_loss_telemetry(sums, output, batch)
+    training_cli._accumulate_loss_telemetry(sums, output, batch)
+
+    assert sums["train/psnr"].dtype == torch.float64
+    assert sums["train/psnr"].device == output.rendering.rgb.device
+    assert sums["train/psnr"].item() == pytest.approx(
+        2.0 * -10.0 * math.log10(0.25)
+    )
+    assert sums["train/ssim"].dtype == torch.float64
+    assert sums["train/ssim"].item() == pytest.approx(1.5)
 
 
 def test_training_loop_hits_exact_target_and_checkpoint_intervals(
@@ -498,7 +548,7 @@ def test_training_loop_hits_exact_target_and_checkpoint_intervals(
     monkeypatch.setattr(
         training_cli,
         "canonical_frame_to_training_batch",
-        lambda frame, row, device: (frame, row, str(device)),
+        _loop_batch,
     )
     trainer = _LoopTrainer()
     checkpoints: list[int] = []
@@ -524,7 +574,7 @@ def test_completed_step_callback_is_resume_safe_and_follows_checkpoint(
     monkeypatch.setattr(
         training_cli,
         "canonical_frame_to_training_batch",
-        lambda frame, row, device: (frame, row, str(device)),
+        _loop_batch,
     )
     trainer = _LoopTrainer(step=2)
     events: list[tuple[str, int]] = []
@@ -555,7 +605,7 @@ def test_training_loop_forwards_exact_json_log_record(
     monkeypatch.setattr(
         training_cli,
         "canonical_frame_to_training_batch",
-        lambda frame, row, device: (frame, row, str(device)),
+        _loop_batch,
     )
     trainer = _LoopTrainer()
     records: list[dict[str, Any]] = []
@@ -574,6 +624,19 @@ def test_training_loop_forwards_exact_json_log_record(
     assert [record["step"] for record in records] == [2, 3]
     assert [record["train/loss"] for record in records] == [1.5, 3.0]
     assert [record["train/rgb_l1"] for record in records] == [1.5, 3.0]
+    assert [record["train/psnr"] for record in records] == pytest.approx(
+        [
+            (
+                -10.0 * math.log10(0.1**2)
+                + -10.0 * math.log10(0.2**2)
+            )
+            / 2.0,
+            -10.0 * math.log10(0.3**2),
+        ]
+    )
+    assert [record["train/ssim"] for record in records] == pytest.approx(
+        [0.85, 0.7]
+    )
     assert all(record["train/gaussians/total"] == 5 for record in records)
     assert all(record["train/gaussians/background"] == 2 for record in records)
     assert all(record["train/gaussians/actors"] == 3 for record in records)
@@ -604,7 +667,7 @@ def test_training_loop_merges_context_payload_only_at_log_steps(
     monkeypatch.setattr(
         training_cli,
         "canonical_frame_to_training_batch",
-        lambda frame, row, device: (frame, row, str(device)),
+        _loop_batch,
     )
     trainer = _LoopTrainer()
     records: list[dict[str, Any]] = []
@@ -640,7 +703,7 @@ def test_training_loop_payload_has_independent_cadence(
     monkeypatch.setattr(
         training_cli,
         "canonical_frame_to_training_batch",
-        lambda frame, row, device: (frame, row, str(device)),
+        _loop_batch,
     )
     trainer = _LoopTrainer()
     records: list[dict[str, Any]] = []
@@ -678,7 +741,7 @@ def test_training_loop_can_disable_payloads(
     monkeypatch.setattr(
         training_cli,
         "canonical_frame_to_training_batch",
-        lambda frame, row, device: (frame, row, str(device)),
+        _loop_batch,
     )
     records: list[dict[str, Any]] = []
 
@@ -706,7 +769,7 @@ def test_training_loop_aggregates_density_update_counts(
     monkeypatch.setattr(
         training_cli,
         "canonical_frame_to_training_batch",
-        lambda frame, row, device: (frame, row, str(device)),
+        _loop_batch,
     )
     trainer = _LoopTrainer()
     original_train_step = trainer.train_step
@@ -765,7 +828,7 @@ def test_training_loop_resumes_an_exactly_exhausted_sampler(
     monkeypatch.setattr(
         training_cli,
         "canonical_frame_to_training_batch",
-        lambda frame, row, device: (frame, row),
+        _loop_batch,
     )
     sampler = StatefulShuffleSampler(2, seed=0, shuffle=False)
     unfinished_iterator = iter(sampler)
@@ -785,7 +848,9 @@ def test_training_loop_resumes_an_exactly_exhausted_sampler(
     )
 
     assert trainer.step == 3
-    assert trainer.batches == [("frame-0", 0)]
+    assert [(batch[0], batch[1]) for batch in trainer.batches] == [
+        ("frame-0", 0)
+    ]
 
 
 def _run_cli(*arguments: str) -> subprocess.CompletedProcess[str]:

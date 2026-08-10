@@ -1,5 +1,10 @@
 """Canonical data contracts and dataset-specific import adapters."""
 
+from .castrack import (
+    CASTRACK_ACTOR_SOURCE,
+    extract_castrack_scene_json,
+    load_castrack_actor_tracks,
+)
 from .kitti import (
     KittiCalibration,
     KittiTracklet,
@@ -37,10 +42,19 @@ from .split import (
     periodic_train_eval_split,
     split_manifest_by_frame_indices,
 )
+from .waymo import (
+    WAYMO_ACTOR_SOURCE,
+    WAYMO_CAMERA_CHANNELS,
+    WAYMO_CAMERA_IDS,
+    WAYMO_OPENCV_TO_NATIVE,
+    load_waymo_world_center,
+    load_waymo_v2_manifest,
+)
 
 __all__ = [
     "ActorTrack",
     "ActorTrackSample",
+    "CASTRACK_ACTOR_SOURCE",
     "CameraConvention",
     "CanonicalDatasetManifest",
     "CanonicalDatasetSplit",
@@ -52,9 +66,17 @@ __all__ = [
     "LidarFrame",
     "LidarProjection",
     "NUSCENES_CAMERA_CHANNELS",
+    "WAYMO_ACTOR_SOURCE",
+    "WAYMO_CAMERA_CHANNELS",
+    "WAYMO_CAMERA_IDS",
+    "WAYMO_OPENCV_TO_NATIVE",
     "canonicalize_kitti_tracklets",
+    "extract_castrack_scene_json",
+    "load_castrack_actor_tracks",
     "load_kitti_manifest",
     "load_nuscenes_manifest",
+    "load_waymo_world_center",
+    "load_waymo_v2_manifest",
     "normalize_nuscenes_scene_name",
     "parse_nuscenes_sky_mask_reject_list",
     "parse_kitti_calibration",

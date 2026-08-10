@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 from pathlib import Path
+import sys
+from types import SimpleNamespace
+
+import numpy as np
 
 import pytest
 import torch
@@ -11,6 +15,7 @@ from armgs.initialization import (
     initialize_gaussians_from_points,
     load_colmap_points3d_text,
     merge_colored_point_clouds,
+    preprocess_streetgs_waymo_background,
     voxel_downsample,
     world_points_to_actor_local,
 )
@@ -186,6 +191,170 @@ def test_lidar_and_sfm_clouds_merge_and_voxel_deduplicate() -> None:
             [[0.5, 0.5, 0.0], [0.0, 0.0, 1.0], [1.0, 1.0, 1.0]]
         ),
     )
+
+
+def _install_fake_open3d(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    filtered_points: np.ndarray,
+    filtered_colors: np.ndarray,
+) -> dict[str, object]:
+    calls: dict[str, object] = {}
+
+    class FakePointCloud:
+        def __init__(self) -> None:
+            self.points = np.empty((0, 3), dtype=np.float64)
+            self.colors = np.empty((0, 3), dtype=np.float64)
+
+        def voxel_down_sample(self, *, voxel_size: float) -> FakePointCloud:
+            calls["voxel_size"] = voxel_size
+            calls["input_points"] = np.array(self.points, copy=True)
+            calls["input_colors"] = np.array(self.colors, copy=True)
+            output = FakePointCloud()
+            output.points = np.asarray(filtered_points, dtype=np.float64)
+            output.colors = np.asarray(filtered_colors, dtype=np.float64)
+            return output
+
+        def remove_radius_outlier(
+            self, *, nb_points: int, radius: float
+        ) -> tuple[FakePointCloud, list[int]]:
+            calls["radius_nb_points"] = nb_points
+            calls["radius"] = radius
+            return self, list(range(len(self.points)))
+
+    fake_open3d = SimpleNamespace(
+        geometry=SimpleNamespace(PointCloud=FakePointCloud),
+        utility=SimpleNamespace(
+            Vector3dVector=lambda values: np.asarray(values, dtype=np.float64)
+        ),
+    )
+    monkeypatch.setitem(sys.modules, "open3d", fake_open3d)
+    return calls
+
+
+def test_streetgs_waymo_background_uses_official_open3d_order_and_no_revoxel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    filtered_lidar = np.array(
+        [[0.0, 0.0, 0.0], [2.0, 0.0, 0.0]], dtype=np.float64
+    )
+    filtered_colors = np.array(
+        [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float64
+    )
+    calls = _install_fake_open3d(
+        monkeypatch,
+        filtered_points=filtered_lidar,
+        filtered_colors=filtered_colors,
+    )
+    lidar_points = torch.tensor(
+        [[-0.01, 0.0, 0.0], [2.01, 0.0, 0.0]], dtype=torch.float32
+    )
+    lidar_colors = torch.tensor(
+        [[0.8, 0.1, 0.0], [0.0, 0.7, 0.2]], dtype=torch.float32
+    )
+    sfm_points = torch.tensor(
+        [[0.0, 0.0, 0.0], [2.999, 0.0, 0.0], [3.0, 0.0, 0.0]]
+    )
+    sfm_colors = torch.tensor(
+        [[0.0, 0.0, 1.0], [0.2, 0.3, 0.4], [1.0, 1.0, 1.0]]
+    )
+
+    result = preprocess_streetgs_waymo_background(
+        lidar_points,
+        lidar_colors,
+        sfm_points,
+        sfm_colors,
+    )
+
+    assert calls["voxel_size"] == 0.15
+    assert calls["radius_nb_points"] == 10
+    assert calls["radius"] == 0.5
+    np.testing.assert_allclose(calls["input_points"], lidar_points.numpy())
+    np.testing.assert_allclose(calls["input_colors"], lidar_colors.numpy())
+    torch.testing.assert_close(
+        result.points,
+        torch.tensor(
+            [
+                [0.0, 0.0, 0.0],
+                [2.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0],
+                [2.999, 0.0, 0.0],
+            ]
+        ),
+    )
+    torch.testing.assert_close(
+        result.colors,
+        torch.tensor(
+            [
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [0.0, 0.0, 1.0],
+                [0.2, 0.3, 0.4],
+            ]
+        ),
+    )
+    assert result.lidar_point_count == 2
+    assert result.sfm_input_point_count == 3
+    assert result.sfm_retained_point_count == 2
+    torch.testing.assert_close(
+        result.lidar_aabb_center, torch.tensor([1.0, 0.0, 0.0])
+    )
+    torch.testing.assert_close(
+        result.lidar_aabb_half_diagonal, torch.tensor(1.0)
+    )
+
+
+def test_streetgs_optional_camera_filter_is_disabled_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    filtered_lidar = np.array(
+        [[0.0, 0.0, 0.0], [10.0, 0.0, 0.0]], dtype=np.float64
+    )
+    _install_fake_open3d(
+        monkeypatch,
+        filtered_points=filtered_lidar,
+        filtered_colors=np.full((2, 3), 0.5, dtype=np.float64),
+    )
+    lidar_points = torch.from_numpy(filtered_lidar).to(torch.float32)
+    lidar_colors = torch.full_like(lidar_points, 0.5)
+    sfm_points = torch.tensor(
+        [[5.0, 0.0, 2.0], [7.0, 0.0, 0.0], [-4.0, 0.0, 3.0]]
+    )
+    sfm_colors = torch.full_like(sfm_points, 0.25)
+    camera_centers = torch.tensor([[5.0, 0.0, 2.0]])
+
+    default = preprocess_streetgs_waymo_background(
+        lidar_points,
+        lidar_colors,
+        sfm_points,
+        sfm_colors,
+        camera_centers=camera_centers,
+        camera_extent=1.0,
+    )
+    filtered = preprocess_streetgs_waymo_background(
+        lidar_points,
+        lidar_colors,
+        sfm_points,
+        sfm_colors,
+        camera_centers=camera_centers,
+        filter_sfm_near_or_below_cameras=True,
+        camera_extent=1.0,
+    )
+
+    assert default.sfm_retained_point_count == 3
+    assert filtered.sfm_retained_point_count == 1
+    torch.testing.assert_close(filtered.points[-1], sfm_points[-1])
+
+
+def test_streetgs_waymo_background_imports_open3d_lazily(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(sys.modules, "open3d", None)
+    points = torch.tensor([[0.0, 0.0, 0.0]])
+    colors = torch.full_like(points, 0.5)
+
+    with pytest.raises(ImportError, match="requires Open3D"):
+        preprocess_streetgs_waymo_background(points, colors)
 
 
 def test_point_cloud_merge_rejects_empty_and_mixed_dtypes() -> None:

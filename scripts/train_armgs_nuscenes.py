@@ -189,6 +189,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--checkpoint-interval",
         type=_positive_int,
         default=1000,
+        help=(
+            "legacy compatibility option; intermediate checkpoints are "
+            "disabled and only final.pt is written"
+        ),
     )
     parser.add_argument("--log-interval", type=_positive_int, default=100)
     parser.add_argument(
@@ -1073,7 +1077,7 @@ def _execute_training_and_evaluation(
     device: torch.device | str,
     checkpoint_interval: int,
     log_interval: int,
-    checkpoint_callback: Any,
+    checkpoint_callback: Any | None,
     log_callback: Any | None,
     log_payload_factory: Any | None,
     image_log_interval: int | None = None,
@@ -1307,14 +1311,6 @@ def run(args: argparse.Namespace) -> Path:
         json.dumps(run_metadata, indent=2, sort_keys=True) + "\n",
     )
 
-    def checkpoint_callback(step: int) -> None:
-        save_training_checkpoint(
-            checkpoints / f"step_{step:08d}.pt",
-            trainer,
-            config,
-            run_metadata,
-        )
-
     wandb_run = _initialize_wandb(
         args,
         config=config,
@@ -1392,7 +1388,7 @@ def run(args: argparse.Namespace) -> Path:
             device=device,
             checkpoint_interval=args.checkpoint_interval,
             log_interval=args.log_interval,
-            checkpoint_callback=checkpoint_callback,
+            checkpoint_callback=None,
             log_callback=(
                 (
                     lambda record: _log_to_wandb(

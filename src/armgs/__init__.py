@@ -34,10 +34,12 @@ from .evaluation import (
 from .geometry import PoseTrajectory, transform_actor_gaussians
 from .initialization import (
     GaussianInitializationConfig,
+    StreetGSBackgroundPreprocessingResult,
     estimate_knn_isotropic_scales,
     initialize_gaussians_from_points,
     load_colmap_points3d_text,
     merge_colored_point_clouds,
+    preprocess_streetgs_waymo_background,
     voxel_downsample,
     world_points_to_actor_local,
 )
@@ -66,6 +68,7 @@ from .training import (
     ArmGSTrainingBatch,
     TrainingStepOutput,
 )
+from .waymo_masks import materialize_actor_bbox_masks
 
 __all__ = [
     "ActorDeformation",
@@ -104,6 +107,7 @@ __all__ = [
     "RasterizationInput",
     "RasterizationOutput",
     "StatefulShuffleSampler",
+    "StreetGSBackgroundPreprocessingResult",
     "TimestampNormalizer",
     "TrainingStepOutput",
     "ViewpointEncoder",
@@ -117,8 +121,10 @@ __all__ = [
     "load_colmap_points3d_text",
     "merge_colored_point_clouds",
     "merge_sfm_background",
+    "materialize_actor_bbox_masks",
     "peak_signal_noise_ratio",
     "pillow_image_reader",
+    "preprocess_streetgs_waymo_background",
     "project_actor_boxes_to_mask",
     "spherical_harmonics_to_rgb",
     "transform_actor_gaussians",

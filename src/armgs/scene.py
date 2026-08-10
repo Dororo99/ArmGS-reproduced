@@ -161,8 +161,8 @@ class DynamicActorModel(nn.Module):
         return float(
             torch.stack(
                 (
-                    1.5 * length / actor_box_scale,
-                    1.5 * width / actor_box_scale,
+                    1.5 * length,
+                    1.5 * width,
                     height,
                 )
             ).max().item()

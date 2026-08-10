@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -100,6 +101,65 @@ def test_projected_lidar_is_colored_and_split_into_actor_and_background(
     )
 
 
+def test_lidar_actor_box_scale_expands_planar_axes_but_not_height(
+    tmp_path: Path,
+) -> None:
+    source = make_manifest(tmp_path)
+    source_frame = source[0]
+    assert source_frame.lidar is not None
+    scan_path = source_frame.lidar.source_path
+    points = torch.tensor(
+        [
+            [1.5, 0.0, 0.0],  # admitted only by planar x expansion
+            [0.0, 0.0, 1.5],  # remains outside the unscaled height
+            [3.0, 0.0, 0.0],  # remains background
+        ]
+    )
+    lidar = LidarFrame(
+        points=points,
+        reflectance=torch.ones(3),
+        sensor_to_world=torch.eye(4),
+        source_path=scan_path,
+    )
+    projection = LidarProjection(
+        camera_id=source_frame.camera_id,
+        source_point_indices=torch.arange(3),
+        image_coordinates=torch.tensor(
+            [[0.1, 0.1], [1.1, 0.1], [2.1, 0.1]]
+        ),
+        pixel_indices=torch.tensor([[0, 0], [1, 0], [2, 0]]),
+        depths=torch.ones(3),
+        image_size=(1, 3),
+    )
+    frame = replace(
+        source_frame,
+        image_size=(1, 3),
+        lidar=lidar,
+        lidar_projection=projection,
+    )
+    manifest = CanonicalDatasetManifest(
+        frames=(frame,), actor_tracks=source.actor_tracks
+    )
+    image = torch.tensor(
+        [[[255, 0, 0], [0, 255, 0], [0, 0, 255]]],
+        dtype=torch.uint8,
+    )
+
+    clouds = collect_colored_lidar_point_clouds(
+        manifest,
+        image_reader=lambda *_: image,
+        actor_box_scale=2.0,
+    )
+
+    torch.testing.assert_close(
+        clouds.actors[7].points, torch.tensor([[1.5, 0.0, 0.0]])
+    )
+    torch.testing.assert_close(
+        clouds.background.points,
+        torch.tensor([[0.0, 0.0, 1.5], [3.0, 0.0, 0.0]]),
+    )
+
+
 def test_scene_builder_creates_background_actor_trajectory_and_time_contract(
     tmp_path: Path,
 ) -> None:
@@ -140,6 +200,9 @@ def test_scene_builder_creates_background_actor_trajectory_and_time_contract(
     assert torch.isfinite(normalized)
     assert scene.actors[0].dimensions_lwh is not None
     assert scene.actors[0].density_extent() == pytest.approx(1.5)
+    assert scene.actors[0].density_extent(actor_box_scale=2.0) == pytest.approx(
+        1.5
+    )
 
 
 def test_training_track_retains_raw_lifecycle_and_extrapolates_boundary_pose(
@@ -276,3 +339,36 @@ def test_sfm_background_merge_preserves_actor_local_clouds() -> None:
         merged.background.points,
         torch.tensor([[0.0, 0.0, 0.0], [2.0, 0.0, 0.0]]),
     )
+
+
+def test_scene_builder_supports_actor_specific_no_voxel_initialization(
+    tmp_path: Path,
+) -> None:
+    manifest = make_manifest(tmp_path)
+    clouds = CanonicalScenePointClouds(
+        background=ColoredPointCloud(
+            torch.tensor([[0.0, 0.0, 3.0], [0.1, 0.0, 3.0]]),
+            torch.tensor([[0.2, 0.3, 0.4], [0.4, 0.3, 0.2]]),
+        ),
+        actors={
+            7: ColoredPointCloud(
+                torch.tensor([[0.0, 0.0, 0.0], [0.1, 0.0, 0.0]]),
+                torch.tensor([[0.8, 0.1, 0.2], [0.2, 0.1, 0.8]]),
+            )
+        },
+    )
+    shared = GaussianInitializationConfig(voxel_size=1.0)
+    inherited = build_scene_from_point_clouds(
+        manifest, clouds, initialization=shared
+    )
+    separate = build_scene_from_point_clouds(
+        manifest,
+        clouds,
+        initialization=shared,
+        actor_initialization=GaussianInitializationConfig(voxel_size=None),
+    )
+
+    assert inherited.background.count == 1
+    assert inherited.actors[0].gaussians.count == 1
+    assert separate.background.count == 1
+    assert separate.actors[0].gaussians.count == 2

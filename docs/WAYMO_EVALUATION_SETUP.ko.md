@@ -1,120 +1,161 @@
-# Waymo 평가 준비 상태
+# ArmGS Waymo 평가 세팅
 
-현재 구현은 **Waymo-v2 parquet 검증, FRONT RGB 추출, 논문 계열 split, PSNR/SSIM/LPIPS 평가 manifest 생성**까지 지원한다. 아직 Waymo에서 ArmGS를 학습시키는 전체 어댑터는 아니다.
+## 현재 평가 경로
 
-| 항목 | 상태 |
+Waymo trainer는 학습 마지막 checkpoint에서 FRONT camera의 두 split을 따로 렌더하고 평가한다.
+
+| split | frame | appearance embedding |
+|---|---|---|
+| `reconstruction` | training source positions | 각 training row의 정확한 learned embedding |
+| `novel_view` | relative source positions 4, 8, 12, … | 같은 camera의 nearest training-frame embedding |
+
+공식 scene 006의 0–85 범위는 train 65장, novel-view 21장이다. 두 split의 점수를 섞지 않으며 최종 표에도 별도로 기록한다.
+
+학습·asset 준비와 paper-mode 계약은 [Waymo 학습 세팅](WAYMO_TRAINING_SETUP.ko.md)을 먼저 참조한다.
+
+## Metric 계약
+
+평가는 clamp된 RGB `[0,1]`에서 이미지별 metric을 구한 뒤 split 안에서 산술 평균한다. FRONT-only이므로 aggregate와 `FRONT` 평균은 같다.
+
+| metric | 구현 계약 |
 |---|---|
-| 7개 parquet component 존재/스키마 검증 | 준비됨 |
-| FRONT 이미지 1600×1066(W×H), lossless PNG 추출 | 준비됨 |
-| training-view reconstruction / held-out novel-view 분리 | 준비됨 |
-| PSNR·SSIM·LPIPS-Alex 계산 | 준비됨 |
-| camera/ego pose를 ArmGS manifest로 변환 | 미구현 |
-| LiDAR + COLMAP SfM 좌표 정합·융합 초기화 | 미구현 |
-| actor track/box canonicalization과 pose 보간 | 미구현 |
-| LiDAR depth 및 Grounded-SAM sky mask 연결 | 미구현 |
-| Waymo end-to-end trainer/render export | 미구현 |
+| PSNR | 이미지별 RGB MSE, data range 1, 이미지별 PSNR의 평균 |
+| SSIM | 3DGS 계열 Gaussian 11×11, σ=1.5, data range 1, 이미지별 평균 |
+| LPIPS | 공식 `lpips` v0.1, RGB를 `[-1,1]`로 변환, Alex backbone, 이미지별 평균 |
+| actor PSNR | CAStrack cuboid projection union 안의 RGB PSNR; actor pixel이 있는 이미지만 평균 |
 
-따라서 지금 생성되는 파일로 GT 이미지 및 split을 고정하고 외부 렌더 결과를 평가할 수는 있지만, 이 단계만으로 `train_armgs*.py`를 Waymo에 실행하면 안 된다.
+ArmGS 논문은 PSNR/SSIM/LPIPS를 보고하지만 LPIPS backbone, crop, 이미지 평균 방식을 모두 공개하지 않는다. 따라서 Alex와 위 평균 규칙은 재현 가능한 로컬 계약이며 결과의 `evaluation_policy.json`과 W&B config에 함께 기록된다.
 
-## 논문 계열 프로토콜
+## 기본 실행
 
-- ArmGS는 Waymo 8개 시퀀스에서 학습/평가하고, StreetGaussians의 실험 설정을 따른다.
-- 공식 StreetGaussians 설정은 FRONT(camera 0), `split_test: 4`를 사용한다. 실제 held-out 상대 frame은 `4, 8, 12, ...`이고 상대 frame 0은 training에 남는다.
-- ArmGS 보고 해상도는 `1066 × 1600`(H×W)이다.
-- 공식 전처리와 맞춰 source width 기준 단일 비율 `5/6`을 이미지와 intrinsic 두 행에 동일하게 적용하고, `1600×1066`으로 BILINEAR resize한 lossless PNG를 쓴다. 높이에서 별도 scale을 계산하지 않는다.
-- 최종 결과는 training view의 reconstruction과 held-out testing view의 novel-view synthesis를 별도로 집계한다.
-- 논문은 RGB PSNR, SSIM, LPIPS를 보고하지만 LPIPS backbone, crop, averaging 세부는 명시하지 않는다. 현재 코드는 재현 가능한 로컬 계약으로 SSIM(11×11 Gaussian, σ=1.5)과 LPIPS-Alex를 이미지별 계산 후 평균한다.
+공식 launcher는 `EVAL_INTERVAL=0`, `--eval-at-end`, `--eval-reconstruction-at-end`, `--eval-lpips`, `--eval-lpips-net alex`를 전달한다. 즉 30k 도중 전체 held-out 렌더는 생략하고 마지막에 두 split을 평가한다.
 
-장면 목록과 StreetGaussians의 inclusive frame 범위는 [`configs/waymo_streetgs_sequences.txt`](../configs/waymo_streetgs_sequences.txt)에 고정했다. [`configs/armgs_waymo_streetgs.yaml`](../configs/armgs_waymo_streetgs.yaml)은 이 목표 프로토콜을 기록하는 reference config이며, 아직 실행 가능한 Waymo trainer config가 아니다.
-
-## 로컬 데이터 확인 결과
-
-`/workspace/data/waymo_v2/training`에는 필요한 7개 component가 모두 있는 context 13개가 있다. 그러나 이 13개와 공식 8개 validation context의 교집합은 **0개**다. 현재 로컬 context로 파이프라인 smoke test는 가능하지만 ArmGS Waymo 표를 직접 재현할 수는 없다. 공식 평가에는 Waymo validation의 아래 8개 context parquet를 별도로 준비해야 한다.
-
-```text
-10448102132863604198_472_000_492_000
-12374656037744638388_1412_711_1432_711
-17612470202990834368_2800_000_2820_000
-1906113358876584689_1359_560_1379_560
-2094681306939952000_2972_300_2992_300
-4246537812751004276_1560_000_1580_000
-5372281728627437618_2005_000_2025_000
-8398516118967750070_3958_000_3978_000
-```
-
-## 준비 실행
-
-환경은 현재 `/venv/camosplat`을 쓴다. index/split만 검증하는 빠른 local smoke test:
-
-```bash
+~~~bash
 cd /workspace/projects/camosplat/dohyun/ArmGS
-EXTRACT_IMAGES=0 scripts/prepare_waymo_evaluation.sh \
-  12251442326766052580_1840_000_1860_000
-```
 
-GT를 추출하고 metric manifest까지 만드는 실행:
+SEQ=10448102132863604198_472_000_492_000
+GPU_ID=0 \
+COLMAP_DIR="$PWD/data/waymo_prepared/colmap_castrack_centered/$SEQ" \
+OUTPUT_DIR="$PWD/outputs/waymo/scene_006/paper" \
+scripts/train_armgs_waymo.sh "$SEQ" 0 85
+~~~
 
-```bash
-EXTRACT_IMAGES=1 scripts/prepare_waymo_evaluation.sh \
-  12251442326766052580_1840_000_1860_000
-```
+필요하면 개발 중 periodic novel-view 평가를 켤 수 있다.
 
-준비 스크립트의 시작과 끝도 StreetGaussians `selected_frames`와 동일한 inclusive 범위다. 공식 scene 006은 그대로 `[0, 85]`를 준다.
+~~~bash
+SEQ=10448102132863604198_472_000_492_000
+EVAL_INTERVAL=5000 \
+COLMAP_DIR="$PWD/data/waymo_prepared/colmap_castrack_centered/$SEQ" \
+scripts/train_armgs_waymo.sh "$SEQ" 0 85
+~~~
 
-```bash
-PARQUET_DIR=validation \
-START_FRAME=0 \
-END_FRAME=85 \
-scripts/prepare_waymo_evaluation.sh \
-  10448102132863604198_472_000_492_000
-```
+이는 학습을 모니터링하기 위한 추가 실행이며 기본 paper-oriented protocol은 final-only다.
 
-출력은 기본적으로 `data/waymo_prepared/<context>/` 아래에 생긴다.
+## Checkpoint만 다시 평가
 
-- `waymo_evaluation_setup.json`: component 경로, calibration, split, frame 메타데이터
-- `targets/FRONT/*.png`: 1600×1066(W×H) lossless GT
-- `reconstruction_manifest.json`: training-view metric pair
-- `novel_view_manifest.json`: held-out metric pair
+같은 `OUTPUT_DIR`, dataset identity, CAStrack, masks와 COLMAP provenance를 사용해야 한다.
 
-`--no-extract-images`인 경우 setup JSON만 쓰며 metric manifest는 만들지 않는다.
+~~~bash
+cd /workspace/projects/camosplat/dohyun/ArmGS
 
-## 렌더와 metric
+SEQ=10448102132863604198_472_000_492_000
+OUT="$PWD/outputs/waymo/scene_006/paper"
+GPU_ID=0 \
+COLMAP_DIR="$PWD/data/waymo_prepared/colmap_castrack_centered/$SEQ" \
+OUTPUT_DIR="$OUT" \
+RESUME="$OUT/checkpoints/final.pt" \
+scripts/train_armgs_waymo.sh "$SEQ" 0 85 -- --eval-only
+~~~
 
-준비 manifest가 예고하는 prediction 위치는 다음과 같다.
+`--eval-only`는 checkpoint write나 추가 optimization 없이 두 split을 렌더한다.
 
-```text
+## 로컬 결과
+
+각 split의 JSON과 첫 FRONT GT/render preview는 다음 위치에 저장된다.
+
+~~~text
+<OUTPUT_DIR>/evaluation_policy.json
+<OUTPUT_DIR>/evaluation/reconstruction/step_00030000.json
+<OUTPUT_DIR>/evaluation/reconstruction/step_00030000_FRONT_gt_render.png
+<OUTPUT_DIR>/evaluation/novel_view/step_00030000.json
+<OUTPUT_DIR>/evaluation/novel_view/step_00030000_FRONT_gt_render.png
+~~~
+
+각 JSON에는 다음 필드가 있다.
+
+- `aggregate`: `psnr`, `ssim`, `lpips`, `actor_psnr`, image/pixel count
+- `per_camera.FRONT`: 같은 metric과 count
+- `previews`: 저장된 GT/render 비교 이미지 경로
+- `policy`: resolution, LPIPS net, metric/actor-mask protocol
+
+모델이 마지막 step에 도달하면 checkpoint 경로와 split aggregate도 W&B summary에 기록된다.
+
+## W&B key
+
+Waymo는 split-qualified namespace를 사용한다.
+
+~~~text
+reconstruction/psnr
+reconstruction/ssim
+reconstruction/lpips
+reconstruction/actor_psnr
+reconstruction/FRONT/psnr
+reconstruction/FRONT/ssim
+reconstruction/FRONT/lpips
+reconstruction/FRONT/actor_psnr
+reconstruction/FRONT/gt_vs_render
+
+novel_view/psnr
+novel_view/ssim
+novel_view/lpips
+novel_view/actor_psnr
+novel_view/FRONT/psnr
+novel_view/FRONT/ssim
+novel_view/FRONT/lpips
+novel_view/FRONT/actor_psnr
+novel_view/FRONT/gt_vs_render
+~~~
+
+NuScenes run의 `eval/CAM_FRONT/...` key와 다르므로 W&B dashboard query도 위 이름을 사용해야 한다.
+
+학습 중에는 별도로 다음을 기록한다.
+
+- `train/psnr`, `train/ssim`: `LOG_INTERVAL` 동안 sampled train images의 평균
+- `train/gt_vs_render`: `IMAGE_LOG_INTERVAL=500`마다 현재 sampled FRONT GT/render
+
+이 train metric은 전체 reconstruction 평가가 아니다. 논문 수치 비교에는 반드시 마지막 `reconstruction/*`와 `novel_view/*`를 사용한다.
+
+## 독립 PNG manifest 평가
+
+[`scripts/prepare_waymo_evaluation.sh`](../scripts/prepare_waymo_evaluation.sh)과 [`scripts/evaluate_waymo_rgb.sh`](../scripts/evaluate_waymo_rgb.sh)은 외부 renderer가 만든 PNG를 평가하는 보조 경로다. 통합 trainer의 final evaluation이 기본 경로이며, 독립 경로를 쓸 때 prediction 파일은 manifest가 지정한 위치에 둔다.
+
+~~~text
 renders/reconstruction/FRONT/<source_frame_index:06d>.png
 renders/novel_view/FRONT/<source_frame_index:06d>.png
-```
+~~~
 
-Waymo renderer가 해당 PNG들을 만든 뒤 각각 평가한다.
-
-```bash
+~~~bash
 scripts/evaluate_waymo_rgb.sh \
   data/waymo_prepared/<context>/reconstruction_manifest.json
 
 scripts/evaluate_waymo_rgb.sh \
   data/waymo_prepared/<context>/novel_view_manifest.json
-```
+~~~
 
-두 split을 섞어 하나의 평균으로 보고하지 않는다. periodic held-out 평가는 개발 모니터링일 뿐 논문 최종 표의 별도 protocol이 아니므로, 고정 30k iteration 결과에서 두 manifest를 각각 평가하는 것을 기본으로 한다.
+통합 trainer와 외부 PNG 경로의 resize, color range, mask 및 metric protocol이 같아야 두 결과를 직접 비교할 수 있다.
 
-## 다음 구현 게이트
+## 최종 확인 항목
 
-Waymo 학습 어댑터는 최소한 다음을 모두 만족해야 한다.
+1. `run_metadata.json`의 `paper_protocol_compliant`와 `paper_protocol_deviations`를 확인한다.
+2. initialization에 LiDAR와 SfM point count가 모두 0보다 큰지 확인한다.
+3. coordinate frame이 `waymo_world_centered`이고 COLMAP world center가 runtime context와 같은지 확인한다.
+4. final JSON의 `num_images`가 scene split 수와 일치하는지 확인한다.
+5. W&B의 `train/gt_vs_render`로 500-step 단위 최적화 상태를 보고, 논문 비교는 final split metric으로만 한다.
+6. 8개 scene 평균을 낼 때 scene별 평균을 어떤 방식으로 다시 평균했는지 별도 표에 명시한다. 논문은 cross-scene weighting 세부를 공개하지 않는다.
 
-1. camera calibration, camera pose, vehicle pose의 좌표계·축 convention을 테스트로 고정한다.
-2. LiDAR 점과 COLMAP SfM 점을 같은 world frame으로 정합한 뒤 background seed로 **함께** 사용한다.
-3. 움직이는 객체 점을 background에서 제거하고 actor box 좌표로 canonicalize한다.
-4. projected LiDAR depth, Grounded-SAM sky mask, actor alpha supervision을 frame manifest에 연결한다.
-5. local refinement → background/actor 단일 depth-order rasterization → sky → global refinement 전체 backward를 검증한다.
-6. 30k iteration 후 reconstruction/novel-view 렌더를 고정 manifest에 내보내고 PSNR·SSIM·LPIPS를 각각 집계한다.
+## 근거
 
-특히 현재 production initialization은 LiDAR만 사용하고 COLMAP parser가 학습 경로에 연결되지 않았다. 두 point cloud를 단순 concatenate하면 좌표 불일치와 동적 객체 ghost가 생길 수 있으므로, 좌표 정합·중복 제거·actor 분리 규약을 먼저 구현해야 한다.
-
-## 근거 자료
-
-- [ArmGS 논문, Methodology 및 Experiments](https://arxiv.org/html/2507.03886)
-- [StreetGaussians 공식 Waymo scene 006 설정](https://github.com/zju3dv/street_gaussians/blob/main/configs/experiments_waymo/waymo_val_006.yaml)
-- [StreetGaussians 공식 split 구현](https://github.com/zju3dv/street_gaussians/blob/main/lib/utils/data_utils.py)
-- [StreetGaussians 공식 dynamic validation 장면 목록](https://github.com/zju3dv/street_gaussians/blob/main/script/waymo/waymo_splits/val_dynamic.txt)
+- [ArmGS 논문: Experiments](https://arxiv.org/html/2507.03886#S4)
+- [StreetGaussians 공식 저장소](https://github.com/zju3dv/street_gaussians)
+- [`src/armgs/evaluation.py`](../src/armgs/evaluation.py)
+- [`scripts/train_armgs_waymo.py`](../scripts/train_armgs_waymo.py)

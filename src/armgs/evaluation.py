@@ -213,7 +213,10 @@ def project_actor_boxes_to_mask(
 
         dimensions = track.dimensions_lwh.to(
             device=device, dtype=compute_dtype
-        ) * scale
+        ).clone()
+        # Match StreetGS/Waymo preprocessing: box_scale expands actor-local
+        # length and width, while the raw tracker height is preserved.
+        dimensions[:2] *= scale
         local_corners = signs * (dimensions / 2.0)
         actor_rotation = quaternion_to_rotation_matrix(
             sample.quaternion_wxyz.to(device=device, dtype=compute_dtype)

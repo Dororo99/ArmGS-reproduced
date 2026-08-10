@@ -65,6 +65,15 @@ def test_nuscenes_scene_0061_enables_strict_paper_auxiliary_losses() -> None:
     assert loss.lambda_foreground == 0.1
 
 
+def test_waymo_profile_uses_streetgs_world_only_large_point_pruning() -> None:
+    config = load_config(ROOT / "configs" / "armgs_waymo_streetgs.yaml")
+    policy = build_density_policy(config, scene_scale=20.0)
+
+    assert policy.thresholds.max_screen_radius is None
+    assert policy.thresholds.max_world_scale == 2.0
+    assert policy.thresholds.prune_large_after_step == 3_000
+
+
 def test_gaussian_sets_concatenate_and_preserve_groups() -> None:
     combined = GaussianSet.concatenate([make_set(0.0), make_set(1.0)])
 

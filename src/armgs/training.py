@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
-from typing import Any
+from typing import Any, Mapping
 
 import torch
 from torch import Tensor, nn
@@ -51,6 +51,96 @@ _RAW_GAUSSIAN_PARAMETER_NAMES = (
     "opacity_logits",
     "sh_coefficients",
 )
+
+_CONFIGURABLE_GROUP_LR_SCHEDULES = frozenset(
+    {
+        "actor_pose_translation",
+        "actor_pose_rotation",
+        "sky",
+    }
+)
+
+
+@dataclass(frozen=True)
+class ExponentialGroupLRScheduleSpec:
+    """One named optimizer group's global-step exponential schedule."""
+
+    initial: float
+    final: float
+    max_steps: int
+    warmup_steps: int = 0
+
+    def __post_init__(self) -> None:
+        if (
+            not math.isfinite(self.initial)
+            or not math.isfinite(self.final)
+            or self.initial <= 0.0
+            or self.final <= 0.0
+        ):
+            raise ValueError(
+                "scheduled learning rates must be finite and positive"
+            )
+        if (
+            isinstance(self.max_steps, bool)
+            or not isinstance(self.max_steps, int)
+            or self.max_steps <= 0
+        ):
+            raise ValueError("schedule max_steps must be a positive integer")
+        if (
+            isinstance(self.warmup_steps, bool)
+            or not isinstance(self.warmup_steps, int)
+            or self.warmup_steps < 0
+            or self.warmup_steps > self.max_steps
+        ):
+            raise ValueError(
+                "schedule warmup_steps must be an integer in [0, max_steps]"
+            )
+
+
+def _group_lr_schedule_specs(
+    config: Mapping[str, Any],
+) -> dict[str, ExponentialGroupLRScheduleSpec]:
+    optimization = config["optimization"]
+    raw_schedules = optimization.get("learning_rate_schedules")
+    if raw_schedules is None:
+        return {}
+    if not isinstance(raw_schedules, Mapping):
+        raise TypeError("optimization.learning_rate_schedules must be a mapping")
+    unknown = set(raw_schedules) - _CONFIGURABLE_GROUP_LR_SCHEDULES
+    if unknown:
+        raise ValueError(
+            "unsupported optimizer group LR schedules: "
+            + ", ".join(sorted(str(name) for name in unknown))
+        )
+
+    specs: dict[str, ExponentialGroupLRScheduleSpec] = {}
+    for group_name, raw_spec in raw_schedules.items():
+        if not isinstance(raw_spec, Mapping):
+            raise TypeError(
+                f"LR schedule for {group_name!r} must be a mapping"
+            )
+        allowed = {"initial", "final", "max_steps", "warmup_steps"}
+        unexpected = set(raw_spec) - allowed
+        if unexpected:
+            raise ValueError(
+                f"unexpected LR schedule keys for {group_name!r}: "
+                + ", ".join(sorted(str(name) for name in unexpected))
+            )
+        missing = {"initial", "final"} - set(raw_spec)
+        if missing:
+            raise ValueError(
+                f"LR schedule for {group_name!r} is missing: "
+                + ", ".join(sorted(missing))
+            )
+        specs[str(group_name)] = ExponentialGroupLRScheduleSpec(
+            initial=float(raw_spec["initial"]),
+            final=float(raw_spec["final"]),
+            max_steps=int(
+                raw_spec.get("max_steps", optimization["iterations"])
+            ),
+            warmup_steps=int(raw_spec.get("warmup_steps", 0)),
+        )
+    return specs
 
 
 def _resize_gaussians_for_checkpoint(
@@ -128,6 +218,7 @@ def build_armgs_optimizer(
     """
 
     learning_rates = config["optimization"]["learning_rates"]
+    group_lr_schedules = _group_lr_schedule_specs(config)
     gaussian_modules = _gaussian_modules(renderer)
     groups: list[dict[str, Any]] = []
     for name, value in (
@@ -199,18 +290,52 @@ def build_armgs_optimizer(
         [module.sh_coefficients for module in gaussian_modules],
         float(learning_rates["sh"]),
     )
-    add_group(
-        "actor_pose",
-        [
-            parameter
-            for actor in renderer.scene.actors
-            for parameter in (
-                actor.trajectory.quaternions,
-                actor.trajectory.translations,
-            )
-        ],
-        float(learning_rates["actor_pose"]),
-    )
+    actor_schedule_names = {
+        "actor_pose_translation",
+        "actor_pose_rotation",
+    }
+    if actor_schedule_names & group_lr_schedules.keys():
+        translation_schedule = group_lr_schedules.get(
+            "actor_pose_translation"
+        )
+        rotation_schedule = group_lr_schedules.get("actor_pose_rotation")
+        add_group(
+            "actor_pose_translation",
+            [
+                actor.trajectory.translations
+                for actor in renderer.scene.actors
+            ],
+            (
+                translation_schedule.initial
+                if translation_schedule is not None
+                else float(learning_rates["actor_pose"])
+            ),
+        )
+        add_group(
+            "actor_pose_rotation",
+            [
+                actor.trajectory.quaternions
+                for actor in renderer.scene.actors
+            ],
+            (
+                rotation_schedule.initial
+                if rotation_schedule is not None
+                else float(learning_rates["actor_pose"])
+            ),
+        )
+    else:
+        add_group(
+            "actor_pose",
+            [
+                parameter
+                for actor in renderer.scene.actors
+                for parameter in (
+                    actor.trajectory.quaternions,
+                    actor.trajectory.translations,
+                )
+            ],
+            float(learning_rates["actor_pose"]),
+        )
     add_group(
         "appearance",
         [
@@ -226,10 +351,17 @@ def build_armgs_optimizer(
         float(learning_rates["actor_deformation"]),
     )
     if renderer.scene.sky is not None:
+        sky_schedule = group_lr_schedules.get("sky")
         add_group(
             "sky",
             list(renderer.scene.sky.parameters()),
-            float(learning_rates.get("sky", learning_rates["appearance"])),
+            (
+                sky_schedule.initial
+                if sky_schedule is not None
+                else float(
+                    learning_rates.get("sky", learning_rates["appearance"])
+                )
+            ),
         )
 
     grouped_ids = [
@@ -306,6 +438,88 @@ class ExponentialMeanLRScheduler:
         return learning_rate
 
 
+class ExponentialGroupLRScheduler:
+    """Update explicitly named optimizer groups from a global training step.
+
+    Warmed-up groups stay frozen at zero before the boundary. Once active, the
+    exponential fraction remains step / max_steps instead of restarting at the
+    warmup boundary, matching the StreetGS pose schedule.
+    """
+
+    def __init__(
+        self,
+        optimizer: torch.optim.Optimizer,
+        schedules: Mapping[str, ExponentialGroupLRScheduleSpec],
+    ) -> None:
+        if not schedules:
+            raise ValueError("at least one optimizer group schedule is required")
+        self.optimizer = optimizer
+        self.schedules = dict(schedules)
+        self._validate_optimizer_groups()
+
+    def _optimizer_groups(self) -> dict[str, dict[str, Any]]:
+        groups: dict[str, dict[str, Any]] = {}
+        for group in self.optimizer.param_groups:
+            name = str(group.get("name", ""))
+            if name in groups:
+                raise RuntimeError(f"duplicate optimizer group name {name!r}")
+            groups[name] = group
+        return groups
+
+    def _validate_optimizer_groups(self) -> None:
+        groups = self._optimizer_groups()
+        missing = set(self.schedules) - set(groups)
+        if missing:
+            raise RuntimeError(
+                "optimizer is missing scheduled groups: "
+                + ", ".join(sorted(missing))
+            )
+
+    def learning_rate_at(self, group_name: str, step: int) -> float:
+        if step < 0:
+            raise ValueError("step cannot be negative")
+        try:
+            spec = self.schedules[group_name]
+        except KeyError as error:
+            raise KeyError(
+                f"optimizer group {group_name!r} is not scheduled"
+            ) from error
+        if step < spec.warmup_steps:
+            return 0.0
+        fraction = min(step, spec.max_steps) / spec.max_steps
+        return spec.initial * (spec.final / spec.initial) ** fraction
+
+    def set_step(self, step: int) -> dict[str, float]:
+        self._validate_optimizer_groups()
+        groups = self._optimizer_groups()
+        learning_rates = {
+            name: self.learning_rate_at(name, step)
+            for name in self.schedules
+        }
+        for name, learning_rate in learning_rates.items():
+            groups[name]["lr"] = learning_rate
+        return learning_rates
+
+    def state_dict(self) -> dict[str, Any]:
+        return {
+            "schedules": {
+                name: {
+                    "initial": spec.initial,
+                    "final": spec.final,
+                    "max_steps": spec.max_steps,
+                    "warmup_steps": spec.warmup_steps,
+                }
+                for name, spec in sorted(self.schedules.items())
+            }
+        }
+
+    def load_state_dict(self, state: Mapping[str, Any]) -> None:
+        if dict(state) != self.state_dict():
+            raise ValueError(
+                "checkpoint optimizer group LR schedules differ from trainer"
+            )
+
+
 class ArmGSTrainer:
     """One-view training loop that connects rendering and equation (9)."""
 
@@ -318,8 +532,10 @@ class ArmGSTrainer:
         sampler: StatefulShuffleSampler | None = None,
         density_controller: GsplatDensityController | None = None,
         *,
+        group_lr_scheduler: ExponentialGroupLRScheduler | None = None,
         opacity_reset_interval: int | None = None,
         sh_degree_interval: int = 1_000,
+        foreground_start_iteration: int = 0,
     ) -> None:
         if density_controller is not None:
             if not isinstance(optimizer, torch.optim.Adam):
@@ -353,6 +569,7 @@ class ArmGSTrainer:
         self.loss = loss
         self.optimizer = optimizer
         self.mean_scheduler = mean_scheduler
+        self.group_lr_scheduler = group_lr_scheduler
         self.sampler = sampler
         self.density_controller = density_controller
         self.opacity_reset_interval = opacity_reset_interval
@@ -362,8 +579,19 @@ class ArmGSTrainer:
             or sh_degree_interval <= 0
         ):
             raise ValueError("sh_degree_interval must be a positive integer")
+        if (
+            isinstance(foreground_start_iteration, bool)
+            or not isinstance(foreground_start_iteration, int)
+            or foreground_start_iteration < 0
+        ):
+            raise ValueError(
+                "foreground_start_iteration must be a non-negative integer"
+            )
         self.sh_degree_interval = sh_degree_interval
+        self.foreground_start_iteration = foreground_start_iteration
         self.step = 0
+        if self.group_lr_scheduler is not None:
+            self.group_lr_scheduler.set_step(0)
         self.renderer.set_active_sh_degree(0)
 
     @classmethod
@@ -392,6 +620,12 @@ class ArmGSTrainer:
             final=float(rates["mean_final"]),
             total_steps=int(optimization["iterations"]),
         )
+        group_schedule_specs = _group_lr_schedule_specs(config)
+        group_lr_scheduler = (
+            ExponentialGroupLRScheduler(optimizer, group_schedule_specs)
+            if group_schedule_specs
+            else None
+        )
         reset_interval: int | None = None
         if density_controller is not None:
             density_config = optimization.get("densification", {})
@@ -404,15 +638,21 @@ class ArmGSTrainer:
             scheduler,
             sampler,
             density_controller,
+            group_lr_scheduler=group_lr_scheduler,
             opacity_reset_interval=reset_interval,
             sh_degree_interval=int(
                 optimization.get("sh_degree_interval", 1_000)
             ),
+            foreground_start_iteration=config["loss"].get(
+                "foreground_start_iteration", 0
+            ),
         )
 
     def train_step(self, batch: ArmGSTrainingBatch) -> TrainingStepOutput:
-        self.mean_scheduler.set_step(self.step)
         optimization_step = self.step + 1
+        self.mean_scheduler.set_step(self.step)
+        if self.group_lr_scheduler is not None:
+            self.group_lr_scheduler.set_step(optimization_step)
         self.renderer.set_active_sh_degree(
             min(
                 self.renderer.maximum_sh_degree,
@@ -462,6 +702,9 @@ class ArmGSTrainer:
                 if batch.actor_bbox_mask is not None
                 and rendering.actor_alpha is not None
                 else batch.actor_bbox_mask
+            ),
+            foreground_active=(
+                optimization_step >= self.foreground_start_iteration
             ),
         )
         density_metadata = rendering.rasterization.metadata
@@ -522,9 +765,29 @@ class ArmGSTrainer:
             ),
             "opacity_reset_interval": self.opacity_reset_interval,
             "sh_degree_interval": self.sh_degree_interval,
+            "foreground_start_iteration": self.foreground_start_iteration,
+            "group_lr_scheduler": (
+                self.group_lr_scheduler.state_dict()
+                if self.group_lr_scheduler is not None
+                else None
+            ),
         }
 
     def load_state_dict(self, state: dict[str, Any]) -> None:
+        checkpoint_group_lr_scheduler = state.get("group_lr_scheduler")
+        if self.group_lr_scheduler is None:
+            if checkpoint_group_lr_scheduler is not None:
+                raise ValueError(
+                    "checkpoint has optimizer group LR schedules but trainer does not"
+                )
+        else:
+            if not isinstance(checkpoint_group_lr_scheduler, Mapping):
+                raise ValueError(
+                    "checkpoint is missing optimizer group LR schedules"
+                )
+            self.group_lr_scheduler.load_state_dict(
+                checkpoint_group_lr_scheduler
+            )
         renderer_state = state["renderer"]
         if not isinstance(renderer_state, dict):
             raise ValueError("checkpoint renderer state must be a mapping")
@@ -547,6 +810,22 @@ class ArmGSTrainer:
         if checkpoint_sh_interval != self.sh_degree_interval:
             raise ValueError(
                 "checkpoint SH degree interval differs from trainer"
+            )
+        checkpoint_foreground_start = state.get(
+            "foreground_start_iteration", 0
+        )
+        if (
+            isinstance(checkpoint_foreground_start, bool)
+            or not isinstance(checkpoint_foreground_start, int)
+            or checkpoint_foreground_start < 0
+        ):
+            raise ValueError(
+                "checkpoint foreground start iteration must be a "
+                "non-negative integer"
+            )
+        if checkpoint_foreground_start != self.foreground_start_iteration:
+            raise ValueError(
+                "checkpoint foreground start iteration differs from trainer"
             )
         density_state = state.get("density_state")
         if density_state is not None:
@@ -591,6 +870,8 @@ class ArmGSTrainer:
                     rng_state.detach().cpu(), device=device_index
                 )
         self.mean_scheduler.set_step(self.step)
+        if self.group_lr_scheduler is not None:
+            self.group_lr_scheduler.set_step(self.step)
         self.renderer.set_active_sh_degree(
             min(
                 self.renderer.maximum_sh_degree,
@@ -602,6 +883,8 @@ class ArmGSTrainer:
 __all__ = [
     "ArmGSTrainer",
     "ArmGSTrainingBatch",
+    "ExponentialGroupLRScheduler",
+    "ExponentialGroupLRScheduleSpec",
     "ExponentialMeanLRScheduler",
     "TrainingStepOutput",
     "build_armgs_optimizer",
