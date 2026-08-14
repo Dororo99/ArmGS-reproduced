@@ -1,5 +1,10 @@
 """Canonical data contracts and dataset-specific import adapters."""
 
+from .castrack import (
+    CASTRACK_ACTOR_SOURCE,
+    extract_castrack_scene_json,
+    load_castrack_actor_tracks,
+)
 from .kitti import (
     KittiCalibration,
     KittiTracklet,
@@ -14,6 +19,14 @@ from .kitti import (
     read_png_size,
     read_velodyne_bin,
 )
+from .nuscenes import (
+    NUSCENES_CAMERA_CHANNELS,
+    load_nuscenes_manifest,
+    normalize_nuscenes_scene_name,
+    parse_nuscenes_sky_mask_reject_list,
+    project_world_lidar_to_image,
+    read_nuscenes_lidar_bin,
+)
 from .schema import (
     ActorTrack,
     ActorTrackSample,
@@ -24,12 +37,28 @@ from .schema import (
     LidarFrame,
     LidarProjection,
 )
+from .split import (
+    CanonicalDatasetSplit,
+    linspace_train_eval_split,
+    periodic_train_eval_split,
+    split_manifest_by_frame_indices,
+)
+from .waymo import (
+    WAYMO_ACTOR_SOURCE,
+    WAYMO_CAMERA_CHANNELS,
+    WAYMO_CAMERA_IDS,
+    WAYMO_OPENCV_TO_NATIVE,
+    load_waymo_world_center,
+    load_waymo_v2_manifest,
+)
 
 __all__ = [
     "ActorTrack",
     "ActorTrackSample",
+    "CASTRACK_ACTOR_SOURCE",
     "CameraConvention",
     "CanonicalDatasetManifest",
+    "CanonicalDatasetSplit",
     "CanonicalFrame",
     "CanonicalFrameDataset",
     "KittiCalibration",
@@ -37,13 +66,30 @@ __all__ = [
     "KittiTrackletPose",
     "LidarFrame",
     "LidarProjection",
+    "NUSCENES_CAMERA_CHANNELS",
+    "WAYMO_ACTOR_SOURCE",
+    "WAYMO_CAMERA_CHANNELS",
+    "WAYMO_CAMERA_IDS",
+    "WAYMO_OPENCV_TO_NATIVE",
     "canonicalize_kitti_tracklets",
+    "extract_castrack_scene_json",
+    "load_castrack_actor_tracks",
     "load_kitti_manifest",
+    "load_nuscenes_manifest",
+    "load_waymo_world_center",
+    "load_waymo_v2_manifest",
+    "linspace_train_eval_split",
+    "normalize_nuscenes_scene_name",
+    "parse_nuscenes_sky_mask_reject_list",
     "parse_kitti_calibration",
     "parse_kitti_poses",
     "parse_kitti_timestamps",
     "parse_kitti_tracklets",
+    "periodic_train_eval_split",
     "project_velodyne_to_image",
+    "project_world_lidar_to_image",
     "read_png_size",
+    "read_nuscenes_lidar_bin",
     "read_velodyne_bin",
+    "split_manifest_by_frame_indices",
 ]

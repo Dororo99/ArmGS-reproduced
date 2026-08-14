@@ -4,7 +4,15 @@ from pathlib import Path
 
 import torch
 
-from armgs.config import build_core, build_loss, load_config
+from armgs.config import (
+    build_core,
+    build_density_policy,
+    build_initialization_config,
+    build_loss,
+    build_sampler,
+    build_sky,
+    load_config,
+)
 from armgs.structures import GaussianSet
 
 
@@ -47,9 +55,58 @@ def test_default_config_builds_paper_layer_counts() -> None:
     torch.testing.assert_close(novel_embedding, expected_embedding)
 
 
+def test_nuscenes_scene_0061_enables_strict_paper_auxiliary_losses() -> None:
+    config = load_config(ROOT / "configs" / "armgs_nuscenes_scene_0061.yaml")
+    loss = build_loss(config)
+
+    assert loss.require_auxiliary
+    assert loss.lambda_depth == 0.01
+    assert loss.lambda_sky == 0.05
+    assert loss.lambda_foreground == 0.1
+
+
+def test_waymo_profile_uses_streetgs_world_only_large_point_pruning() -> None:
+    config = load_config(ROOT / "configs" / "armgs_waymo_streetgs.yaml")
+    policy = build_density_policy(config, scene_scale=20.0)
+
+    assert policy.thresholds.max_screen_radius is None
+    assert policy.thresholds.max_world_scale == 2.0
+    assert policy.thresholds.prune_large_after_step == 3_000
+
+
 def test_gaussian_sets_concatenate_and_preserve_groups() -> None:
     combined = GaussianSet.concatenate([make_set(0.0), make_set(1.0)])
 
     assert combined.count == 2
     assert combined.sh_degree == 3
     torch.testing.assert_close(combined.group_ids, torch.tensor([0, 1]))
+
+
+def test_default_config_builds_data_initialization_and_density_contracts() -> None:
+    config = load_config(ROOT / "configs" / "armgs_default.yaml")
+
+    initialization = build_initialization_config(config)
+    assert initialization.sh_degree == 3
+    assert initialization.initial_opacity == 0.1
+    assert initialization.voxel_size == 0.1
+
+    sky = build_sky(config)
+    assert sky.resolution == (256, 256)
+
+    policy = build_density_policy(config, scene_scale=10.0)
+    assert not policy.schedule.is_due(500)
+    assert policy.schedule.is_due(600)
+    assert policy.schedule.is_due(14_900)
+    assert not policy.schedule.is_due(15_000)
+    assert policy.thresholds.position_gradient_threshold == 0.0002
+    assert policy.thresholds.split_scale_threshold == 0.1
+    assert policy.thresholds.prune_opacity_threshold == 0.005
+    assert policy.thresholds.max_screen_radius == 20.0
+    assert policy.thresholds.max_world_scale == 1.0
+    assert policy.thresholds.prune_large_after_step == 3_000
+    assert policy.thresholds.minimum_gaussians == 0
+
+    sampler = build_sampler(config, dataset_size=5)
+    assert sampler.dataset_size == 5
+    assert sampler.seed == 0
+    assert sampler.shuffle

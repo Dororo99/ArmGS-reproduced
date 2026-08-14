@@ -1,0 +1,158 @@
+# ArmGS Waymo/StreetGS paper-protocol training profile.
+# Used directly by scripts/train_armgs_waymo.py. Undisclosed hyperparameters
+# remain documented implementation assumptions.
+model:
+  frame_embedding_dim: 16
+  sh_degree: 1                  # official StreetGS Waymo validation profiles
+  local:
+    hidden_dim: 64
+    num_layers: 3                 # ArmGS paper
+    scale_delta_limit: null       # paper-unbounded Eq. 3-4 affine
+    bias_limit: null              # paper-unbounded Eq. 3-4 affine
+    hash_grid:
+      num_levels: 8
+      features_per_level: 2
+      log2_hashmap_size: 15
+      base_resolution: 16
+      max_resolution: 2048
+      chunk_size: 65536
+  global:
+    hidden_dim: 64
+    num_layers: 4                 # ArmGS paper
+    position_frequencies: 6
+    direction_frequencies: 4
+    matrix_delta_limit: null      # paper-unbounded Eq. 5-6 affine
+    bias_limit: null              # paper-unbounded Eq. 5-6 affine
+  actor:
+    hidden_dim: 64
+    encoder_layers: 2             # ArmGS paper
+    head_layers: 2                # ArmGS paper
+    position_frequencies: 6
+    time_frequencies: 6
+  sky:
+    resolution: 1024              # StreetGS Waymo cubemap assumption
+    initial_color: [0.5, 0.5, 0.5]
+
+initialization:
+  initial_opacity: 0.1            # implementation assumption
+  initial_scale: 0.05             # implementation assumption
+  knn_neighbors: 3
+  knn_chunk_size: 1024
+  knn_backend: auto
+  minimum_squared_distance: 0.0000001
+  # The official StreetGS pass below already performs the only background
+  # voxel operation; Gaussian initialization must not re-voxel the merge.
+  voxel_size: null
+  actor_box_scale: 1.0
+  streetgs_waymo:
+    background_voxel_size: 0.15
+    radius_outlier_nb_points: 10
+    radius_outlier_radius: 0.5
+    sfm_extent_multiplier: 2.0
+    filter_colmap_near_or_below_cameras: false
+    # Official StreetGS actor initialization: retain every LiDAR point when
+    # there are at least 2,000; otherwise replace it with a 20^3 bbox grid.
+    actor_min_lidar_points: 2000
+    actor_max_lidar_points: null
+    actor_fallback_grid_resolution: 20
+    actor_fallback_random_seed: 0
+  # Paper-required sources; paper-mode makes the COLMAP input mandatory.
+  required_sources: [lidar, sfm]
+
+data:
+  waymo:
+    format: v2_parquet
+    parquet_dir: validation
+    camera_channels: [FRONT]      # official StreetGS experiment configs use camera 0
+    lidar_returns: first          # StreetGS initialization uses return1
+    scene_extent: 20.0            # official StreetGS validation profiles
+    target_height: 1066           # ArmGS paper evaluation resolution
+    target_width: 1600
+    resize:
+      scale_from_source_width: 0.8333333333333334  # 5/6, also applied to both K rows
+      interpolation: bilinear
+      image_format: png           # lossless GT targets
+    official_sequences: configs/waymo_streetgs_sequences.txt
+  split:
+    every: 4                      # StreetGS split_test: 4
+    offset: 0
+    start_position: 4             # held out: relative captures 4, 8, 12, ...
+  sampler:
+    seed: 0
+    shuffle: true
+    num_workers: 0
+
+optimization:
+  iterations: 30000              # ArmGS paper
+  sh_degree_interval: 1000
+  learning_rates:
+    mean_initial: 0.00016
+    mean_final: 0.0000016
+    rotation: 0.001
+    scale: 0.005
+    opacity: 0.05
+    sh: 0.0025
+    appearance: 0.001
+    actor_deformation: 0.001
+    actor_pose: 0.0001          # legacy fallback; overridden below
+    sky: 0.001                 # legacy fallback; overridden below
+  # ArmGS does not publish actor-pose or sky learning rates. These explicit
+  # schedules reproduce the StreetGS Waymo profile inherited by ArmGS. Pose
+  # decay uses the global 1-based iteration (it does not restart after warmup).
+  learning_rate_schedules:
+    actor_pose_translation:
+      initial: 0.005
+      final: 0.00005
+      warmup_steps: 3000
+      max_steps: 30000
+    actor_pose_rotation:
+      initial: 0.001
+      final: 0.00001
+      warmup_steps: 3000
+      max_steps: 30000
+    sky:
+      initial: 0.01
+      final: 0.0001
+      max_steps: 30000
+  densification:
+    start_iteration: 500
+    end_iteration: 15000
+    interval: 100
+    position_gradient_threshold: 0.0002
+    split_scale_fraction_of_scene: 0.01
+    prune_opacity_threshold: 0.005
+    split_children: 2
+    split_scale_reduction: 1.6
+    opacity_reset_value: 0.01
+    opacity_reset_interval: 3000
+    # StreetGS' background/actor-specific density paths ignore the generic
+    # 3DGS screen-space pruning threshold and prune large points in world
+    # space instead.
+    max_screen_radius: null
+    prune_world_scale_fraction_of_scene: 0.1
+    prune_large_after_iteration: 3000
+    minimum_gaussians: 0
+    prune_actor_outside_box: true  # official StreetGS actor containment
+
+loss:
+  lambda_ssim: 0.2
+  ssim_window_size: 11
+  ssim_sigma: 1.5
+  ssim_data_range: 1.0
+  require_auxiliary: true
+  lambda_depth: 0.01
+  lambda_sky: 0.05
+  lambda_foreground: 0.1
+  # ArmGS does not disclose this timing; StreetGS activates the foreground
+  # regularizer at iteration >= densification end (15k).
+  foreground_start_iteration: 15000
+
+# Metadata for final reporting. The current config loader ignores this block;
+# scripts/evaluate_armgs.py implements these metrics from rendered RGB files.
+evaluation:
+  views: [reconstruction, novel_view]
+  metrics: [psnr, ssim, lpips]
+  lpips_net: alex
+  resolution: [1066, 1600]
+  target_format: png
+  periodic_test_evaluation: false

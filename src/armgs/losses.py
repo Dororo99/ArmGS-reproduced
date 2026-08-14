@@ -122,14 +122,18 @@ def sky_mask_loss(
     non_sky_accumulated_alpha: Tensor,
     target_sky_mask: Tensor,
     *,
+    valid_mask: Tensor | None = None,
     eps: float = 1.0e-6,
 ) -> Tensor:
     if non_sky_accumulated_alpha.shape != target_sky_mask.shape:
         raise ValueError("alpha and sky mask must have matching shapes")
     sky_probability = (1.0 - non_sky_accumulated_alpha).clamp(eps, 1.0 - eps)
-    return F.binary_cross_entropy(
-        sky_probability, target_sky_mask.to(sky_probability)
+    per_pixel = F.binary_cross_entropy(
+        sky_probability,
+        target_sky_mask.to(sky_probability),
+        reduction="none",
     )
+    return _safe_masked_mean(per_pixel, valid_mask)
 
 
 def foreground_entropy_loss(
@@ -216,9 +220,13 @@ class ArmGSLoss(nn.Module):
         depth_valid_mask: Tensor | None = None,
         non_sky_accumulated_alpha: Tensor | None = None,
         target_sky_mask: Tensor | None = None,
+        sky_valid_mask: Tensor | None = None,
         actor_alpha: Tensor | None = None,
         actor_bbox_mask: Tensor | None = None,
+        foreground_active: bool = True,
     ) -> LossBreakdown:
+        if not isinstance(foreground_active, bool):
+            raise TypeError("foreground_active must be a boolean")
         rgb = rgb_l1_loss(prediction_rgb, target_rgb)
         ssim = 1.0 - structural_similarity(
             prediction_rgb,
@@ -238,7 +246,11 @@ class ArmGSLoss(nn.Module):
                 non_sky_accumulated_alpha is None or target_sky_mask is None
             ):
                 missing.append("sky")
-            if self.lambda_foreground > 0.0 and actor_alpha is None:
+            if (
+                foreground_active
+                and self.lambda_foreground > 0.0
+                and actor_alpha is None
+            ):
                 missing.append("foreground")
             if missing:
                 raise ValueError("missing required auxiliary loss inputs: " + ", ".join(missing))
@@ -253,18 +265,27 @@ class ArmGSLoss(nn.Module):
 
         if (non_sky_accumulated_alpha is None) != (target_sky_mask is None):
             raise ValueError("non-sky alpha and target sky mask must be supplied together")
+        if sky_valid_mask is not None and target_sky_mask is None:
+            raise ValueError("sky_valid_mask requires a target sky mask")
         sky = (
-            sky_mask_loss(non_sky_accumulated_alpha, target_sky_mask)
+            sky_mask_loss(
+                non_sky_accumulated_alpha,
+                target_sky_mask,
+                valid_mask=sky_valid_mask,
+            )
             if non_sky_accumulated_alpha is not None and target_sky_mask is not None
             else zero
         )
-        if actor_bbox_mask is not None and actor_alpha is None:
-            raise ValueError("actor_bbox_mask requires actor_alpha")
-        foreground = (
-            foreground_entropy_loss(actor_alpha, actor_bbox_mask)
-            if actor_alpha is not None
-            else zero
-        )
+        if foreground_active:
+            if actor_bbox_mask is not None and actor_alpha is None:
+                raise ValueError("actor_bbox_mask requires actor_alpha")
+            foreground = (
+                foreground_entropy_loss(actor_alpha, actor_bbox_mask)
+                if actor_alpha is not None
+                else zero
+            )
+        else:
+            foreground = zero
 
         total = (
             (1.0 - self.lambda_ssim) * rgb
@@ -281,4 +302,3 @@ class ArmGSLoss(nn.Module):
             sky=sky,
             foreground=foreground,
         )
-

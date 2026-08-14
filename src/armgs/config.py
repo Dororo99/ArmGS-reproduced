@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
+import torch
 import yaml
 from torch import Tensor
 
@@ -16,9 +18,19 @@ from .appearance import (
     NearestFrameLookup,
     ViewpointEncoder,
 )
+from .density import (
+    DensificationSchedule,
+    DensityControlThresholds,
+    GaussianDensityPolicy,
+    GsplatDensityController,
+)
 from .encodings import HashGridEncoder
+from .initialization import GaussianInitializationConfig
 from .losses import ArmGSLoss
 from .model import ArmGSCore
+from .sampling import StatefulShuffleSampler
+from .scene import CompositeGaussianScene
+from .sky import ExplicitCubemapSky
 
 
 def load_config(path: str | Path) -> dict[str, Any]:
@@ -134,3 +146,188 @@ def build_loss(config: dict[str, Any]) -> ArmGSLoss:
         ssim_sigma=float(loss_config.get("ssim_sigma", 1.5)),
         ssim_data_range=float(loss_config.get("ssim_data_range", 1.0)),
     )
+
+def build_initialization_config(
+    config: dict[str, Any],
+) -> GaussianInitializationConfig:
+    initialization = config.get("initialization")
+    if not isinstance(initialization, dict):
+        raise ValueError("configuration is missing 'initialization'")
+    voxel_size = initialization.get("voxel_size")
+    return GaussianInitializationConfig(
+        sh_degree=int(config["model"]["sh_degree"]),
+        initial_opacity=float(initialization["initial_opacity"]),
+        initial_scale=float(initialization["initial_scale"]),
+        voxel_size=float(voxel_size) if voxel_size is not None else None,
+        knn_neighbors=int(initialization.get("knn_neighbors", 3)),
+        knn_chunk_size=int(initialization.get("knn_chunk_size", 1024)),
+        knn_backend=str(initialization.get("knn_backend", "auto")),
+        minimum_squared_distance=float(
+            initialization.get("minimum_squared_distance", 1.0e-7)
+        ),
+    )
+
+
+def build_sky(config: dict[str, Any]) -> ExplicitCubemapSky:
+    sky_config = config["model"].get("sky")
+    if not isinstance(sky_config, dict):
+        raise ValueError("configuration is missing 'model.sky'")
+    return ExplicitCubemapSky(
+        int(sky_config["resolution"]),
+        initial_color=tuple(float(value) for value in sky_config["initial_color"]),
+    )
+
+
+def build_density_policy(
+    config: dict[str, Any],
+    *,
+    scene_scale: float,
+    actor_box_half_extents: tuple[float, float, float] | None = None,
+) -> GaussianDensityPolicy:
+    if not math.isfinite(scene_scale) or scene_scale <= 0.0:
+        raise ValueError("scene_scale must be finite and positive")
+    density = config["optimization"].get("densification")
+    if not isinstance(density, dict):
+        raise ValueError("configuration is missing 'optimization.densification'")
+    maximum_radius = density.get("max_screen_radius")
+    world_scale_fraction = density.get(
+        "prune_world_scale_fraction_of_scene", 0.1
+    )
+    reset_value = density.get("opacity_reset_value")
+    schedule = DensificationSchedule(
+        start_step=int(density["start_iteration"]),
+        end_step=int(density["end_iteration"]),
+        interval=int(density["interval"]),
+    )
+    thresholds = DensityControlThresholds(
+        position_gradient_threshold=float(
+            density["position_gradient_threshold"]
+        ),
+        split_scale_threshold=(
+            float(density["split_scale_fraction_of_scene"]) * scene_scale
+        ),
+        prune_opacity_threshold=float(
+            density["prune_opacity_threshold"]
+        ),
+        split_children=int(density["split_children"]),
+        split_scale_reduction=float(density["split_scale_reduction"]),
+        opacity_reset_value=(
+            float(reset_value) if reset_value is not None else None
+        ),
+        max_screen_radius=(
+            float(maximum_radius) if maximum_radius is not None else None
+        ),
+        max_world_scale=(
+            float(world_scale_fraction) * scene_scale
+            if world_scale_fraction is not None
+            else None
+        ),
+        prune_large_after_step=int(
+            density.get(
+                "prune_large_after_iteration",
+                density.get("opacity_reset_interval", 3_000),
+            )
+        ),
+        minimum_gaussians=int(density.get("minimum_gaussians", 0)),
+    )
+    return GaussianDensityPolicy(
+        thresholds,
+        schedule=schedule,
+        actor_box_half_extents=actor_box_half_extents,
+    )
+
+
+def build_sampler(
+    config: dict[str, Any],
+    *,
+    dataset_size: int,
+) -> StatefulShuffleSampler:
+    sampler = config.get("data", {}).get("sampler")
+    if not isinstance(sampler, dict):
+        raise ValueError("configuration is missing 'data.sampler'")
+    workers = int(sampler.get("num_workers", 0))
+    if workers != 0:
+        raise ValueError(
+            "exact mid-epoch checkpoint resume requires data.sampler.num_workers=0"
+        )
+    return StatefulShuffleSampler(
+        dataset_size,
+        seed=int(sampler.get("seed", 0)),
+        shuffle=bool(sampler.get("shuffle", True)),
+    )
+
+
+def build_density_controller(
+    config: dict[str, Any],
+    scene: CompositeGaussianScene,
+    *,
+    scene_scale: float,
+    actor_box_scale: float = 1.0,
+    group_scene_scales: Mapping[int, float] | None = None,
+) -> GsplatDensityController:
+    if not math.isfinite(actor_box_scale) or actor_box_scale <= 0.0:
+        raise ValueError("actor_box_scale must be finite and positive")
+    modules = {
+        -1: scene.background,
+        **{
+            actor.actor_id: actor.gaussians
+            for actor in scene.actors
+        },
+    }
+    if group_scene_scales is not None:
+        if set(group_scene_scales) != set(modules):
+            raise ValueError(
+                "group_scene_scales must match background/actor groups"
+            )
+        resolved_scales = {
+            group_id: float(group_scene_scales[group_id])
+            for group_id in modules
+        }
+    else:
+        resolved_scales = {
+            -1: scene_scale,
+            **{
+                actor.actor_id: (
+                    actor.density_extent(actor_box_scale=actor_box_scale)
+                    if getattr(actor, "dimensions_lwh", None) is not None
+                    else scene_scale
+                )
+                for actor in scene.actors
+            },
+        }
+    density = config["optimization"].get("densification")
+    if not isinstance(density, dict):
+        raise ValueError(
+            "configuration is missing 'optimization.densification'"
+        )
+    prune_actor_outside_box = density.get(
+        "prune_actor_outside_box", False
+    )
+    if not isinstance(prune_actor_outside_box, bool):
+        raise TypeError("prune_actor_outside_box must be a boolean")
+    actor_half_extents: dict[int, tuple[float, float, float]] = {}
+    if prune_actor_outside_box:
+        for actor in scene.actors:
+            dimensions = getattr(actor, "dimensions_lwh", None)
+            if dimensions is None:
+                raise ValueError(
+                    "prune_actor_outside_box requires actor dimensions_lwh"
+                )
+            # Waymo/StreetGS expands only the ground-plane length and width.
+            # Scene actors intentionally retain the raw tracker dimensions.
+            effective = dimensions.detach().to(
+                device="cpu", dtype=torch.float64
+            ).clone()
+            effective[:2] *= actor_box_scale
+            actor_half_extents[actor.actor_id] = tuple(
+                float(value) for value in (effective * 0.5).tolist()
+            )
+    policy = {
+        group_id: build_density_policy(
+            config,
+            scene_scale=resolved_scales[group_id],
+            actor_box_half_extents=actor_half_extents.get(group_id),
+        )
+        for group_id in modules
+    }
+    return GsplatDensityController(modules, policy)

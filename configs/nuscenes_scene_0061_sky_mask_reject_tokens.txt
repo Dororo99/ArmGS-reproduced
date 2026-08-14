@@ -1,0 +1,22 @@
+# scene-0061 Grounded-SAM masks with visually confirmed false-positive sky.
+# Raw PNGs are preserved; the trainer skips only the sky BCE for these frames.
+# One lowercase 32-character nuScenes sample_data token per line.
+
+e5c06f809d9b4149801701aefd99eac5
+661d9842bbb44b208f867f2061c4f535
+20c88e8439ad42a2be8a55f3792dd697
+cea975f3a41c4026a528c180f8633917
+32ba4a3ebd1f41cc8ea37a2407707c09
+8666a3072c084e6d8905ae750868093f
+acebdb6721764000b5b40fa49f71fe10
+35ac9f8a55d54525ad0e8acb424a6111
+ea9e0aee2da44b6caaa9b7dc382575ab
+3dbcbf06f133430b9a6b3d2b49e5302f
+554db7eaf1f844f3ada0706b190a7e22
+90badfbefa37451ba5bf3fe8724b7e68
+9afbb7f0491b4390b87e1aea06cf8fa4
+54646dc84b8a4a0b82d2bf385f2bc825
+9c54c5a1df41483797364c256cd3d9a6
+fc09a3b0da784daf8a42fd5d3d3d3579
+ce7f2a8f2cab45d589d94774bb7e94c2
+a4d57a738cf14a458af5850f8a62e3e5

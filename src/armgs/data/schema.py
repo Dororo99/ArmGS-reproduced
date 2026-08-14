@@ -51,7 +51,10 @@ def _validate_timestamp(timestamp: Tensor, name: str = "timestamp") -> None:
 
 @dataclass(frozen=True)
 class LidarFrame:
-    """A Velodyne scan in sensor coordinates plus its world transform."""
+    """Velodyne points in sensor coordinates plus their world transform.
+
+    A dataset adapter may retain a projection-visible subset of the raw scan.
+    """
 
     points: Tensor
     reflectance: Tensor
@@ -168,12 +171,19 @@ class ActorTrackSample:
 
 @dataclass(frozen=True)
 class ActorTrack:
-    """Object identity, size, and its finite lifecycle in the sequence."""
+    """Object identity, size, trainable pose knots, and raw lifecycle.
+
+    ``samples`` may be a train/evaluation subset after a dataset split.  The
+    lifecycle bounds remain those of the unsplit raw track so a held-out
+    boundary observation does not make an otherwise known actor disappear.
+    """
 
     actor_id: int
     class_name: str
     dimensions_lwh: Tensor
     samples: tuple[ActorTrackSample, ...]
+    lifecycle_start_timestamp: Tensor | None = None
+    lifecycle_end_timestamp: Tensor | None = None
 
     def __post_init__(self) -> None:
         if self.actor_id < 0:
@@ -194,14 +204,42 @@ class ActorTrack:
         if any(right <= left for left, right in zip(frame_indices, frame_indices[1:])):
             raise ValueError("actor frame indices must be strictly increasing")
 
+        start = self.lifecycle_start_timestamp
+        end = self.lifecycle_end_timestamp
+        if (start is None) != (end is None):
+            raise ValueError(
+                "actor lifecycle start and end timestamps must be provided together"
+            )
+        if start is None:
+            start = self.samples[0].timestamp.detach().clone()
+            end = self.samples[-1].timestamp.detach().clone()
+            object.__setattr__(self, "lifecycle_start_timestamp", start)
+            object.__setattr__(self, "lifecycle_end_timestamp", end)
+        assert end is not None
+        _validate_timestamp(start, "actor lifecycle start timestamp")
+        _validate_timestamp(end, "actor lifecycle end timestamp")
+        if int(start.item()) > int(end.item()):
+            raise ValueError("actor lifecycle start must not exceed its end")
+        if int(start.item()) > timestamps[0] or int(end.item()) < timestamps[-1]:
+            raise ValueError("actor lifecycle must contain every actor sample")
+
     @property
     def lifecycle_timestamps(self) -> tuple[Tensor, Tensor]:
-        return self.samples[0].timestamp, self.samples[-1].timestamp
+        start = self.lifecycle_start_timestamp
+        end = self.lifecycle_end_timestamp
+        assert start is not None and end is not None
+        return start, end
 
 
 @dataclass(frozen=True)
 class CanonicalFrame:
-    """One camera observation and all optional supervision aligned to it."""
+    """One camera observation and all optional supervision aligned to it.
+
+    ``timestamp`` is the exact sensor observation time used for camera-aware
+    actor interpolation and appearance lookup. ``capture_timestamp`` is the
+    nominal dataset sample time used only to group asynchronous camera rows
+    into one atomic capture for train/evaluation splitting.
+    """
 
     timestamp: Tensor
     camera_id: int
@@ -211,13 +249,20 @@ class CanonicalFrame:
     image_path: Path
     image_size: tuple[int, int]
     frame_index: int
+    capture_timestamp: Tensor | None = None
     lidar: LidarFrame | None = None
     lidar_projection: LidarProjection | None = None
     sky_mask_path: Path | None = None
     actor_mask_path: Path | None = None
+    sky_supervision_valid: bool = True
 
     def __post_init__(self) -> None:
         _validate_timestamp(self.timestamp)
+        capture_timestamp = self.capture_timestamp
+        if capture_timestamp is None:
+            capture_timestamp = self.timestamp.detach().clone()
+            object.__setattr__(self, "capture_timestamp", capture_timestamp)
+        _validate_timestamp(capture_timestamp, "capture_timestamp")
         if self.camera_id < 0 or self.frame_index < 0:
             raise ValueError("camera_id and frame_index must be non-negative")
         if self.camera_convention not in ("opencv", "opengl"):
@@ -238,6 +283,12 @@ class CanonicalFrame:
                 "sky_mask_path",
                 _as_existing_file(self.sky_mask_path, "sky mask"),
             )
+        if not isinstance(self.sky_supervision_valid, bool):
+            raise TypeError("sky_supervision_valid must be a boolean")
+        if not self.sky_supervision_valid and self.sky_mask_path is None:
+            raise ValueError(
+                "invalid sky supervision requires a raw sky mask target"
+            )
         if self.actor_mask_path is not None:
             object.__setattr__(
                 self,
@@ -255,6 +306,12 @@ class CanonicalFrame:
                 self.lidar_projection.source_point_indices >= self.lidar.points.shape[0]
             ):
                 raise ValueError("lidar projection refers to a missing source point")
+
+    @property
+    def observation_timestamp(self) -> Tensor:
+        """Return the exact sensor time (an explicit alias for ``timestamp``)."""
+
+        return self.timestamp
 
 
 @dataclass(frozen=True)

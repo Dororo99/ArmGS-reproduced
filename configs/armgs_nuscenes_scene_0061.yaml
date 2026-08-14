@@ -1,0 +1,96 @@
+# ArmGS paper-loss profile for nuScenes v1.0-trainval scene-0061.
+#
+# Projected LiDAR supplies depth, and the scene launcher requires pre-extracted
+# Grounded-SAM sky masks. Foreground entropy is computed directly from rendered
+# actor alpha and does not require a target actor pixel mask.
+model:
+  frame_embedding_dim: 16
+  sh_degree: 3
+  local:
+    hidden_dim: 64
+    num_layers: 3
+    scale_delta_limit: 1.0
+    bias_limit: 0.5
+    hash_grid:
+      num_levels: 8
+      features_per_level: 2
+      log2_hashmap_size: 15
+      base_resolution: 16
+      max_resolution: 2048
+      chunk_size: 65536
+  global:
+    hidden_dim: 64
+    num_layers: 4
+    position_frequencies: 6
+    direction_frequencies: 4
+    matrix_delta_limit: 0.5
+    bias_limit: 0.5
+  actor:
+    hidden_dim: 64
+    encoder_layers: 2
+    head_layers: 2
+    position_frequencies: 6
+    time_frequencies: 6
+  sky:
+    resolution: 256
+    initial_color: [0.5, 0.5, 0.5]
+
+initialization:
+  initial_opacity: 0.1
+  initial_scale: 0.05
+  knn_neighbors: 3
+  knn_chunk_size: 1024
+  knn_backend: auto
+  minimum_squared_distance: 0.0000001
+  voxel_size: 0.1
+  actor_box_scale: 1.0
+
+data:
+  split:
+    every: 8
+    offset: 0
+    start_position: 1           # held out: 8, 16, 24, 32; keep boundary frame 0
+  sampler:
+    seed: 0
+    shuffle: true
+    num_workers: 0
+
+optimization:
+  iterations: 30000
+  sh_degree_interval: 1000
+  learning_rates:
+    mean_initial: 0.00016
+    mean_final: 0.0000016
+    rotation: 0.001
+    scale: 0.005
+    opacity: 0.05
+    sh: 0.0025
+    appearance: 0.001
+    actor_deformation: 0.001
+    actor_pose: 0.0001
+    sky: 0.001
+  densification:
+    start_iteration: 500
+    end_iteration: 15000
+    interval: 100
+    position_gradient_threshold: 0.0002
+    split_scale_fraction_of_scene: 0.01
+    prune_opacity_threshold: 0.005
+    split_children: 2
+    split_scale_reduction: 1.6
+    opacity_reset_value: 0.01
+    opacity_reset_interval: 3000
+    max_screen_radius: 20
+    prune_world_scale_fraction_of_scene: 0.1
+    prune_large_after_iteration: 3000
+    minimum_gaussians: 0
+
+loss:
+  lambda_ssim: 0.2
+  ssim_window_size: 11
+  ssim_sigma: 1.5
+  ssim_data_range: 1.0
+  require_auxiliary: true       # fail if enabled depth/sky supervision is missing
+  lambda_depth: 0.01            # projected LIDAR_TOP supervision
+  lambda_sky: 0.05              # pre-extracted Grounded-SAM sky masks
+  lambda_foreground: 0.1        # entropy of rendered actor alpha

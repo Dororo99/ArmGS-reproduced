@@ -134,7 +134,13 @@ class PoseTrajectory(nn.Module):
         )
         return result
 
-    def interpolate(self, query_timestamps: Tensor) -> InterpolatedPose:
+    def interpolate(
+        self, query_timestamps: Tensor, *, extrapolate: bool = False
+    ) -> InterpolatedPose:
+        """Interpolate poses, optionally extrapolating at trajectory boundaries."""
+
+        if not isinstance(extrapolate, bool):
+            raise TypeError("extrapolate must be a boolean")
         queries = query_timestamps.reshape(-1).to(self.timestamps)
         if not torch.isfinite(queries).all():
             raise ValueError("query timestamps must be finite")
@@ -151,9 +157,9 @@ class PoseTrajectory(nn.Module):
         lower = upper - 1
         lower_time = self.timestamps[lower]
         upper_time = self.timestamps[upper]
-        weight = (
-            (queries - lower_time) / (upper_time - lower_time)
-        ).clamp(0.0, 1.0)
+        weight = (queries - lower_time) / (upper_time - lower_time)
+        if not extrapolate:
+            weight = weight.clamp(0.0, 1.0)
         weight = weight.to(self.translations)
 
         translations = torch.lerp(
@@ -182,4 +188,3 @@ def transform_actor_gaussians(
         means=world_means,
         quaternions=world_quaternions,
     )
-

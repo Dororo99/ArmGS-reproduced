@@ -7,6 +7,8 @@ supports streaming over scenes that do not fit in memory.
 
 from __future__ import annotations
 
+import math
+from collections.abc import Sequence
 from dataclasses import dataclass
 from importlib import import_module
 from typing import Any
@@ -14,11 +16,242 @@ from typing import Any
 import torch
 from torch import Tensor, nn
 
+from .data.schema import ActorTrack, CanonicalFrame
+from .geometry import quaternion_to_rotation_matrix
 from .losses import structural_similarity
 
 
 class LPIPSUnavailableError(RuntimeError):
     """Raised when LPIPS was requested but its optional package is unavailable."""
+
+
+_CUBOID_EDGES = (
+    (0, 1),
+    (0, 2),
+    (0, 4),
+    (1, 3),
+    (1, 5),
+    (2, 3),
+    (2, 6),
+    (3, 7),
+    (4, 5),
+    (4, 6),
+    (5, 7),
+    (6, 7),
+)
+
+
+def _positive_finite_float(value: float, *, name: str) -> float:
+    try:
+        result = float(value)
+    except (TypeError, ValueError) as error:
+        raise TypeError(f"{name} must be a finite positive number") from error
+    if not math.isfinite(result) or result <= 0.0:
+        raise ValueError(f"{name} must be a finite positive number")
+    return result
+
+
+def _near_clipped_cuboid_vertices(corners: Tensor, near_plane: float) -> Tensor:
+    """Return vertices of a cuboid clipped to camera-space z >= near."""
+
+    near = corners.new_tensor(near_plane)
+    in_front = corners[:, 2] >= near
+    vertices = [corner for corner in corners[in_front]]
+    for start_index, end_index in _CUBOID_EDGES:
+        start = corners[start_index]
+        end = corners[end_index]
+        start_front = bool(in_front[start_index].item())
+        end_front = bool(in_front[end_index].item())
+        if start_front == end_front:
+            continue
+        weight = (near - start[2]) / (end[2] - start[2])
+        vertices.append(start + weight * (end - start))
+    if not vertices:
+        return corners.new_empty((0, 3))
+    return torch.stack(vertices)
+
+
+def _convex_hull_2d(points: Tensor) -> list[tuple[int, int]]:
+    """Return the counter-clockwise hull of rounded projected vertices.
+
+    StreetGS rasterizes the projected cuboid faces after rounding image
+    coordinates. A cuboid is convex, so the union of those faces has the same
+    interior as the convex hull of its projected (near-plane-clipped) vertices.
+    """
+
+    rounded = torch.round(points).to(device="cpu", dtype=torch.int64)
+    unique = sorted({(int(x), int(y)) for x, y in rounded.tolist()})
+    if len(unique) <= 1:
+        return unique
+
+    def cross(
+        origin: tuple[int, int],
+        first: tuple[int, int],
+        second: tuple[int, int],
+    ) -> int:
+        return (first[0] - origin[0]) * (second[1] - origin[1]) - (
+            first[1] - origin[1]
+        ) * (second[0] - origin[0])
+
+    lower: list[tuple[int, int]] = []
+    for point in unique:
+        while len(lower) >= 2 and cross(lower[-2], lower[-1], point) <= 0:
+            lower.pop()
+        lower.append(point)
+    upper: list[tuple[int, int]] = []
+    for point in reversed(unique):
+        while len(upper) >= 2 and cross(upper[-2], upper[-1], point) <= 0:
+            upper.pop()
+        upper.append(point)
+    return lower[:-1] + upper[:-1]
+
+
+def _fill_projected_cuboid(mask: Tensor, projected_vertices: Tensor) -> None:
+    """Rasterize a projected convex cuboid silhouette into mask in place."""
+
+    hull = _convex_hull_2d(projected_vertices)
+    if len(hull) < 3:
+        return
+    height, width = mask.shape
+    first_row = max(0, min(point[1] for point in hull))
+    last_row = min(height - 1, max(point[1] for point in hull))
+    if first_row > last_row:
+        return
+
+    edges = tuple(zip(hull, hull[1:] + hull[:1]))
+    for row in range(first_row, last_row + 1):
+        intersections: list[float] = []
+        for (x0, y0), (x1, y1) in edges:
+            if y0 == y1:
+                if row == y0:
+                    intersections.extend((float(x0), float(x1)))
+                continue
+            if min(y0, y1) <= row <= max(y0, y1):
+                weight = (row - y0) / (y1 - y0)
+                intersections.append(x0 + weight * (x1 - x0))
+        if not intersections:
+            continue
+        first_column = max(0, math.ceil(min(intersections) - 1.0e-9))
+        last_column = min(
+            width - 1, math.floor(max(intersections) + 1.0e-9)
+        )
+        if first_column <= last_column:
+            mask[row, first_column : last_column + 1] = True
+
+
+@torch.inference_mode()
+def project_actor_boxes_to_mask(
+    frame: CanonicalFrame,
+    actor_tracks: Sequence[ActorTrack],
+    *,
+    box_scale: float = 1.0,
+    near_plane: float = 1.0e-3,
+) -> Tensor:
+    """Project exact-frame actor boxes into a union image-space silhouette mask.
+
+    The returned bool[H,W] mask is intended for the paper's actor-region PSNR,
+    not as pixel-accurate actor supervision. Each track contributes only when
+    it contains a sample whose frame_index exactly matches frame; poses are
+    never interpolated. Cuboid edges are clipped against the camera near plane
+    before projection so boxes crossing the camera plane remain finite and
+    conservatively cover their visible image region.
+
+    dimensions_lwh are interpreted along actor-local x/y/z and actor
+    quaternions use [w,x,y,z]. OpenCV cameras use +z forward and +y down. For
+    OpenGL cameras, native y and z are flipped into OpenCV projection
+    coordinates before applying frame.intrinsics.
+    """
+
+    if not isinstance(frame, CanonicalFrame):
+        raise TypeError("frame must be a CanonicalFrame")
+    if isinstance(actor_tracks, (str, bytes)) or not isinstance(
+        actor_tracks, Sequence
+    ):
+        raise TypeError("actor_tracks must be a sequence of ActorTrack objects")
+    scale = _positive_finite_float(box_scale, name="box_scale")
+    near = _positive_finite_float(near_plane, name="near_plane")
+
+    height, width = frame.image_size
+    device = frame.camera_to_world.device
+    compute_dtype = (
+        torch.float64
+        if frame.camera_to_world.dtype == torch.float64
+        or frame.intrinsics.dtype == torch.float64
+        else torch.float32
+    )
+    camera_to_world = frame.camera_to_world.to(device=device, dtype=compute_dtype)
+    intrinsics = frame.intrinsics.to(device=device, dtype=compute_dtype)
+    camera_rotation = camera_to_world[:3, :3]
+    camera_translation = camera_to_world[:3, 3]
+    mask = torch.zeros((height, width), dtype=torch.bool, device=device)
+    signs = camera_to_world.new_tensor(
+        [
+            [-1.0, -1.0, -1.0],
+            [-1.0, -1.0, 1.0],
+            [-1.0, 1.0, -1.0],
+            [-1.0, 1.0, 1.0],
+            [1.0, -1.0, -1.0],
+            [1.0, -1.0, 1.0],
+            [1.0, 1.0, -1.0],
+            [1.0, 1.0, 1.0],
+        ]
+    )
+
+    for track in actor_tracks:
+        if not isinstance(track, ActorTrack):
+            raise TypeError("actor_tracks must contain only ActorTrack objects")
+        sample = next(
+            (
+                candidate
+                for candidate in track.samples
+                if candidate.frame_index == frame.frame_index
+            ),
+            None,
+        )
+        if sample is None:
+            continue
+
+        dimensions = track.dimensions_lwh.to(
+            device=device, dtype=compute_dtype
+        ).clone()
+        # Match StreetGS/Waymo preprocessing: box_scale expands actor-local
+        # length and width, while the raw tracker height is preserved.
+        dimensions[:2] *= scale
+        local_corners = signs * (dimensions / 2.0)
+        actor_rotation = quaternion_to_rotation_matrix(
+            sample.quaternion_wxyz.to(device=device, dtype=compute_dtype)
+        )
+        actor_translation = sample.translation.to(
+            device=device, dtype=compute_dtype
+        )
+        world_corners = local_corners @ actor_rotation.T + actor_translation
+        camera_corners = (world_corners - camera_translation) @ camera_rotation
+        if frame.camera_convention == "opengl":
+            camera_corners[:, 1:] = -camera_corners[:, 1:]
+        elif frame.camera_convention != "opencv":
+            # CanonicalFrame validates this, but retain a local defensive check.
+            raise ValueError("camera_convention must be 'opencv' or 'opengl'")
+
+        clipped = _near_clipped_cuboid_vertices(camera_corners, near)
+        if clipped.numel() == 0:
+            continue
+        homogeneous_pixels = clipped @ intrinsics.T
+        denominators = homogeneous_pixels[:, 2]
+        projectable = torch.isfinite(homogeneous_pixels).all(dim=-1) & (
+            denominators > torch.finfo(compute_dtype).eps
+        )
+        if not projectable.any():
+            continue
+        pixels = (
+            homogeneous_pixels[projectable, :2]
+            / denominators[projectable, None]
+        )
+        pixels = pixels[torch.isfinite(pixels).all(dim=-1)]
+        if pixels.numel() == 0:
+            continue
+        _fill_projected_cuboid(mask, pixels)
+
+    return mask
 
 
 def _to_nchw(images: Tensor, *, name: str) -> Tensor:
@@ -42,12 +275,59 @@ def _to_nchw(images: Tensor, *, name: str) -> Tensor:
         raise ValueError(
             f"{name} must have shape [3,H,W], [H,W,3], [B,3,H,W], or [B,H,W,3]"
         )
+    return images.contiguous()
+
+
+def _validate_data_range(data_range: float) -> float:
+    try:
+        value = float(data_range)
+    except (TypeError, ValueError) as error:
+        raise TypeError("data_range must be a finite positive number") from error
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError("data_range must be a finite positive number")
+    return value
+
+
+def _normalize_rgb(
+    images: Tensor,
+    *,
+    selected: Tensor,
+    name: str,
+    data_range: float,
+) -> Tensor:
+    """Convert supported RGB encodings to the metric domain ``[0, 1]``.
+
+    ``uint8`` has an intrinsic range of ``[0, 255]``. Floating-point tensors
+    use the caller-provided ``data_range``. Validation deliberately follows the
+    valid mask so masked non-finite padding retains its historical behavior.
+    """
+
+    if images.dtype == torch.uint8:
+        return images.to(torch.float32).div_(255.0)
     if not images.is_floating_point():
-        images = images.to(torch.float32)
-    elif images.device.type == "cpu" and images.dtype in (torch.float16, torch.bfloat16):
+        raise TypeError(
+            f"{name} has unsupported RGB dtype {images.dtype}; expected torch.uint8 "
+            "values in [0, 255] or a floating-point tensor in [0, data_range]"
+        )
+
+    selected_values = images.masked_select(selected)
+    if not torch.isfinite(selected_values).all():
+        raise ValueError(f"{name} contains non-finite values in the valid region")
+    observed_min = float(selected_values.amin().item())
+    observed_max = float(selected_values.amax().item())
+    if observed_min < 0.0 or observed_max > data_range:
+        raise ValueError(
+            f"{name} floating-point RGB values in the valid region must lie in "
+            f"[0, {data_range:g}]; observed [{observed_min:g}, {observed_max:g}]"
+        )
+
+    if images.device.type == "cpu" and images.dtype in (
+        torch.float16,
+        torch.bfloat16,
+    ):
         # CPU conv2d support for low precision depends on the installed Torch build.
         images = images.to(torch.float32)
-    return images.contiguous()
+    return images / data_range
 
 
 def _to_mask(
@@ -102,21 +382,33 @@ def _validated_inputs(
     prediction: Tensor,
     target: Tensor,
     valid_mask: Tensor | None,
+    *,
+    data_range: float,
 ) -> tuple[Tensor, Tensor, Tensor]:
+    data_range = _validate_data_range(data_range)
     prediction = _to_nchw(prediction, name="prediction")
-    target = _to_nchw(target, name="target").to(
-        device=prediction.device, dtype=prediction.dtype
-    )
+    target = _to_nchw(target, name="target").to(device=prediction.device)
     if prediction.shape != target.shape:
         raise ValueError("prediction and target must have matching shapes")
     valid = _to_mask(valid_mask, reference=prediction, name="valid_mask")
     if not valid.any():
         raise ValueError("valid_mask selects no pixels")
     selected = valid.expand_as(prediction)
-    if not torch.isfinite(prediction.masked_select(selected)).all():
-        raise ValueError("prediction contains non-finite values in the valid region")
-    if not torch.isfinite(target.masked_select(selected)).all():
-        raise ValueError("target contains non-finite values in the valid region")
+    prediction = _normalize_rgb(
+        prediction,
+        selected=selected,
+        name="prediction",
+        data_range=data_range,
+    )
+    target = _normalize_rgb(
+        target,
+        selected=selected,
+        name="target",
+        data_range=data_range,
+    )
+    common_dtype = torch.promote_types(prediction.dtype, target.dtype)
+    prediction = prediction.to(dtype=common_dtype)
+    target = target.to(dtype=common_dtype)
     return prediction, target, valid
 
 
@@ -146,13 +438,14 @@ def peak_signal_noise_ratio(
     one-channel spatial mask and is broadcast over RGB channels.
     """
 
-    if data_range <= 0:
-        raise ValueError("data_range must be positive")
-    prediction, target, valid = _validated_inputs(prediction, target, valid_mask)
+    data_range = _validate_data_range(data_range)
+    prediction, target, valid = _validated_inputs(
+        prediction, target, valid_mask, data_range=data_range
+    )
     squared_error, count = _masked_squared_error(prediction, target, valid)
     mse = squared_error / count
     return 10.0 * torch.log10(
-        torch.as_tensor(data_range**2, dtype=mse.dtype, device=mse.device) / mse
+        torch.ones((), dtype=mse.dtype, device=mse.device) / mse
     )
 
 
@@ -231,9 +524,10 @@ class LPIPSMetric:
         valid_mask: Tensor | None = None,
         data_range: float = 1.0,
     ) -> Tensor:
-        if data_range <= 0:
-            raise ValueError("data_range must be positive")
-        prediction, target, valid = _validated_inputs(prediction, target, valid_mask)
+        data_range = _validate_data_range(data_range)
+        prediction, target, valid = _validated_inputs(
+            prediction, target, valid_mask, data_range=data_range
+        )
         values: list[Tensor] = []
         for index in range(prediction.shape[0]):
             spatial = valid[index, 0]
@@ -247,8 +541,8 @@ class LPIPSMetric:
             target_crop = target[index : index + 1, :, y_min:y_max, x_min:x_max]
             pred_crop = torch.where(image_mask, pred_crop, torch.zeros_like(pred_crop))
             target_crop = torch.where(image_mask, target_crop, torch.zeros_like(target_crop))
-            pred_crop = pred_crop.to(self.device, torch.float32) / data_range * 2.0 - 1.0
-            target_crop = target_crop.to(self.device, torch.float32) / data_range * 2.0 - 1.0
+            pred_crop = pred_crop.to(self.device, torch.float32) * 2.0 - 1.0
+            target_crop = target_crop.to(self.device, torch.float32) * 2.0 - 1.0
             values.append(self.model(pred_crop, target_crop).mean())
         return torch.stack(values).mean().cpu()
 
@@ -287,17 +581,18 @@ def evaluate_image_pair(
 ) -> ImageMetrics:
     """Evaluate one image or batch, including optional actor-box PSNR."""
 
-    if data_range <= 0:
-        raise ValueError("data_range must be positive")
+    data_range = _validate_data_range(data_range)
     if ssim_window_size <= 0 or ssim_window_size % 2 == 0:
         raise ValueError("ssim_window_size must be a positive odd integer")
     if ssim_sigma <= 0:
         raise ValueError("ssim_sigma must be positive")
-    prediction, target, valid = _validated_inputs(prediction, target, valid_mask)
+    prediction, target, valid = _validated_inputs(
+        prediction, target, valid_mask, data_range=data_range
+    )
     squared_error, value_count = _masked_squared_error(prediction, target, valid)
     mse = squared_error / value_count
     psnr_value = 10.0 * torch.log10(
-        torch.as_tensor(data_range**2, dtype=mse.dtype, device=mse.device) / mse
+        torch.ones((), dtype=mse.dtype, device=mse.device) / mse
     )
     ssim_value = _masked_structural_similarity(
         prediction,
@@ -305,12 +600,12 @@ def evaluate_image_pair(
         valid,
         window_size=ssim_window_size,
         sigma=ssim_sigma,
-        data_range=data_range,
+        data_range=1.0,
     )
     lpips_value = (
         float(
             lpips_metric(
-                prediction, target, valid_mask=valid, data_range=data_range
+                prediction, target, valid_mask=valid, data_range=1.0
             ).item()
         )
         if lpips_metric is not None
@@ -329,7 +624,7 @@ def evaluate_image_pair(
             actor_mse = actor_squared_error / actor_value_count
             actor_score = 10.0 * torch.log10(
                 torch.as_tensor(
-                    data_range**2, dtype=actor_mse.dtype, device=actor_mse.device
+                    1.0, dtype=actor_mse.dtype, device=actor_mse.device
                 )
                 / actor_mse
             )
@@ -359,15 +654,14 @@ class EvaluationAccumulator:
         lpips_device: torch.device | str = "cpu",
         lpips_metric: LPIPSMetric | None = None,
     ) -> None:
-        if data_range <= 0:
-            raise ValueError("data_range must be positive")
+        data_range = _validate_data_range(data_range)
         if ssim_window_size <= 0 or ssim_window_size % 2 == 0:
             raise ValueError("ssim_window_size must be a positive odd integer")
         if ssim_sigma <= 0:
             raise ValueError("ssim_sigma must be positive")
         if compute_lpips and lpips_metric is not None:
             raise ValueError("supply compute_lpips or lpips_metric, not both")
-        self.data_range = float(data_range)
+        self.data_range = data_range
         self.ssim_window_size = int(ssim_window_size)
         self.ssim_sigma = float(ssim_sigma)
         self.lpips_metric = (
@@ -392,7 +686,7 @@ class EvaluationAccumulator:
         actor_mask: Tensor | None = None,
     ) -> None:
         prediction_nchw, target_nchw, valid = _validated_inputs(
-            prediction, target, valid_mask
+            prediction, target, valid_mask, data_range=self.data_range
         )
         actor = (
             _to_mask(actor_mask, reference=prediction_nchw, name="actor_mask")
@@ -405,7 +699,7 @@ class EvaluationAccumulator:
                 target_nchw[index],
                 valid_mask=valid[index],
                 actor_mask=actor[index] if actor is not None else None,
-                data_range=self.data_range,
+                data_range=1.0,
                 ssim_window_size=self.ssim_window_size,
                 ssim_sigma=self.ssim_sigma,
                 lpips_metric=self.lpips_metric,
@@ -463,5 +757,6 @@ __all__ = [
     "StreamingMetricAccumulator",
     "evaluate_image_pair",
     "peak_signal_noise_ratio",
+    "project_actor_boxes_to_mask",
     "psnr",
 ]
