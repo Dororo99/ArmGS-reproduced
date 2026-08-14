@@ -9,8 +9,10 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
+import math
 from types import MappingProxyType
 
+import numpy as np
 import torch
 from torch import Tensor
 
@@ -292,8 +294,51 @@ def periodic_train_eval_split(
     return _build_split(manifest, groups, selected)
 
 
+def linspace_train_eval_split(
+    manifest: CanonicalDatasetManifest,
+    *,
+    train_fraction: float = 0.5,
+) -> CanonicalDatasetSplit:
+    """Select a SplatAD-compatible LINSPACE subset for training.
+
+    For ``N`` timestamp-ordered captures, this selects
+    ``ceil(N * train_fraction)`` training positions with
+    ``numpy.linspace(0, N - 1, ..., dtype=int64)`` and assigns the complement
+    to evaluation. Complete captures remain atomic, which is exactly the
+    per-sensor SplatAD rule for the single FRONT camera used by ArmGS Waymo.
+    """
+
+    if isinstance(train_fraction, bool):
+        raise TypeError("train_fraction must be a real number")
+    try:
+        fraction = float(train_fraction)
+    except (TypeError, ValueError) as error:
+        raise TypeError("train_fraction must be a real number") from error
+    if not math.isfinite(fraction) or not 0.0 < fraction < 1.0:
+        raise ValueError("train_fraction must be finite and satisfy 0 < value < 1")
+
+    groups = _capture_groups(manifest)
+    num_train = math.ceil(len(groups) * fraction)
+    train_positions = frozenset(
+        int(position)
+        for position in np.linspace(
+            0,
+            len(groups) - 1,
+            num_train,
+            dtype=np.int64,
+        )
+    )
+    eval_frame_indices = frozenset(
+        frame_index
+        for position, (frame_index, _, _) in enumerate(groups)
+        if position not in train_positions
+    )
+    return _build_split(manifest, groups, eval_frame_indices)
+
+
 __all__ = [
     "CanonicalDatasetSplit",
+    "linspace_train_eval_split",
     "periodic_train_eval_split",
     "split_manifest_by_frame_indices",
 ]

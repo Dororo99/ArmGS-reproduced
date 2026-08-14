@@ -10,6 +10,10 @@ __pycache__/
 /third_party/Grounded-Segment-Anything/
 /checkpoints/grounded_sam/
 /data/nuscenes
+/data/waymo
+/data/waymo_v2
 /data/sky_masks/
 /data/waymo_prepared/
 /outputs/
+/logs/
+/wandb/

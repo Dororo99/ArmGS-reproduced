@@ -29,6 +29,12 @@ Environment overrides:
   PREPARED_ROOT           Shared preparation root
   OUTPUT_ROOT             Per-context output parent
   LOG_ROOT                Per-context launcher log parent
+  SPLIT_TYPE              streetgs-periodic or linspace
+  TRAIN_SPLIT_FRACTION    fraction for linspace (default: 0.5)
+  LIDAR_INITIALIZATION_FRAMES
+                           all-selected or train-only
+  COLMAP_TAG              COLMAP asset directory name (default: colmap)
+  RUN_NAME_PREFIX         W&B run-name prefix
   RUN_PREPARE             Generate/reuse sky masks and COLMAP, 1/0 (default: 1)
   BATCH_LOCK              Reject a concurrent copy of this batch, 1/0 (default: 1)
   AUTO_RESUME             Resume the newest checkpoint, 1/0 (default: 1)
@@ -99,6 +105,11 @@ PREPARED_ROOT="${PREPARED_ROOT:-${ARMGS_ROOT}/data/waymo_prepared}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-${ARMGS_ROOT}/outputs/waymo}"
 LOG_ROOT="${LOG_ROOT:-${ARMGS_ROOT}/logs/waymo_splatad_batch}"
 OUTPUT_TAG="${OUTPUT_TAG:-splatad_30k}"
+SPLIT_TYPE="${SPLIT_TYPE:-streetgs-periodic}"
+TRAIN_SPLIT_FRACTION="${TRAIN_SPLIT_FRACTION:-0.5}"
+LIDAR_INITIALIZATION_FRAMES="${LIDAR_INITIALIZATION_FRAMES:-all-selected}"
+COLMAP_TAG="${COLMAP_TAG:-colmap}"
+RUN_NAME_PREFIX="${RUN_NAME_PREFIX:-armgs_waymo_splatad}"
 ARMGS_PYTHON="${ARMGS_PYTHON:-/venv/camosplat/bin/python}"
 GSAM_PYTHON="${GSAM_PYTHON:-/venv/armgs-gsam/bin/python}"
 COLMAP_BINARY="${COLMAP_BINARY:-/usr/bin/colmap}"
@@ -159,6 +170,20 @@ done
 (( GPU_POLL_SECONDS > 0 )) || die "GPU_POLL_SECONDS must be positive"
 [[ "${OUTPUT_TAG}" =~ ^[A-Za-z0-9_.-]+$ ]] ||
   die "OUTPUT_TAG must be one safe path component"
+[[ "${COLMAP_TAG}" =~ ^[A-Za-z0-9_.-]+$ ]] ||
+  die "COLMAP_TAG must be one safe path component"
+[[ "${RUN_NAME_PREFIX}" =~ ^[A-Za-z0-9_.-]+$ ]] ||
+  die "RUN_NAME_PREFIX must be one safe W&B name component"
+case "${SPLIT_TYPE}" in
+  streetgs-periodic|linspace) ;;
+  *) die "SPLIT_TYPE must be streetgs-periodic or linspace" ;;
+esac
+awk -v value="${TRAIN_SPLIT_FRACTION}"   'BEGIN { exit !(value ~ /^[0-9]+([.][0-9]+)?$/ && value > 0 && value < 1) }' ||
+  die "TRAIN_SPLIT_FRACTION must satisfy 0 < value < 1"
+case "${LIDAR_INITIALIZATION_FRAMES}" in
+  all-selected|train-only) ;;
+  *) die "LIDAR_INITIALIZATION_FRAMES must be all-selected or train-only" ;;
+esac
 
 IFS=',' read -r -a GPU_ID_VALUES <<< "${GPU_IDS_RAW}"
 (( ${#GPU_ID_VALUES[@]} == 2 )) ||
@@ -202,7 +227,9 @@ print_queue() {
 
 print_header() {
   printf 'ArmGS Waymo two-GPU batch\n'
-  printf '  protocol: training split, full context, FRONT, every-fourth holdout\n'
+  printf '  protocol: training split, full context, FRONT, %s (fraction=%s)\n' \
+    "${SPLIT_TYPE}" "${TRAIN_SPLIT_FRACTION}"
+  printf '  LiDAR initialization: %s\n' "${LIDAR_INITIALIZATION_FRAMES}"
   printf '  actors: Waymo GT lidar_box fallback, planar box scale=1.0\n'
   printf '  steps/preparation: %s / %s\n' "${ITERATIONS}" "${RUN_PREPARE}"
   printf '  outputs: %s/<sequence>/%s\n' "${OUTPUT_ROOT}" "${OUTPUT_TAG}"
@@ -225,8 +252,8 @@ print_dry_run_scene() {
   fi
   printf '[dry-run][GPU %s] train %s -> %s\n' \
     "${gpu}" "${sequence}" "${output_dir}"
-  printf '  env: PARQUET_DIR=training PAPER_MODE=0 ITERATIONS=%s ACTOR_BOX_SCALE=1.0\n' \
-    "${ITERATIONS}"
+  printf '  env: PARQUET_DIR=training PAPER_MODE=0 ITERATIONS=%s ACTOR_BOX_SCALE=1.0 SPLIT_TYPE=%s TRAIN_SPLIT_FRACTION=%s\n' \
+    "${ITERATIONS}" "${SPLIT_TYPE}" "${TRAIN_SPLIT_FRACTION}"
 }
 
 print_header
@@ -291,7 +318,7 @@ scene_assets_ready() {
   local start="$2"
   local end="$3"
   local colmap_dir mask_name source_index
-  colmap_dir="${PREPARED_ROOT}/colmap/${sequence}"
+  colmap_dir="${PREPARED_ROOT}/${COLMAP_TAG}/${sequence}"
   [[ -s "${colmap_dir}/triangulated_text/points3D.txt" ]] || return 1
   [[ -s "${colmap_dir}/mapping.json" ]] || return 1
   for (( source_index=start; source_index<=end; source_index++ )); do
@@ -353,7 +380,7 @@ prepare_scene() {
   local end="$4"
   local output_dir="$5"
   local colmap_dir castrack_path
-  colmap_dir="${PREPARED_ROOT}/colmap/${sequence}"
+  colmap_dir="${PREPARED_ROOT}/${COLMAP_TAG}/${sequence}"
   castrack_path="${PREPARED_ROOT}/tracking/castrack/${sequence}.json"
 
   if scene_assets_ready "${sequence}" "${start}" "${end}"; then
@@ -379,6 +406,9 @@ prepare_scene() {
     COLMAP_POINTS3D="${colmap_dir}/triangulated_text/points3D.txt" \
     CAS_TRACK_PATH="${castrack_path}" \
     ACTOR_BOX_SCALE=1.0 \
+    SPLIT_TYPE="${SPLIT_TYPE}" \
+    TRAIN_SPLIT_FRACTION="${TRAIN_SPLIT_FRACTION}" \
+    LIDAR_INITIALIZATION_FRAMES="${LIDAR_INITIALIZATION_FRAMES}" \
     OUTPUT_DIR="${output_dir}" \
     ARMGS_PYTHON="${ARMGS_PYTHON}" \
     GSAM_PYTHON="${GSAM_PYTHON}" \
@@ -405,9 +435,9 @@ train_scene() {
   local eval_only="$7"
   local colmap_dir castrack_path run_name
   local -a extra_args=()
-  colmap_dir="${PREPARED_ROOT}/colmap/${sequence}"
+  colmap_dir="${PREPARED_ROOT}/${COLMAP_TAG}/${sequence}"
   castrack_path="${PREPARED_ROOT}/tracking/castrack/${sequence}.json"
-  run_name="armgs_waymo_splatad_${sequence}_${ITERATIONS}"
+  run_name="${RUN_NAME_PREFIX}_${sequence}_${ITERATIONS}"
   if [[ "${eval_only}" == "1" ]]; then
     extra_args=(-- --eval-only)
   fi
@@ -422,6 +452,9 @@ train_scene() {
     COLMAP_POINTS3D="${colmap_dir}/triangulated_text/points3D.txt" \
     CAS_TRACK_PATH="${castrack_path}" \
     ACTOR_BOX_SCALE=1.0 \
+    SPLIT_TYPE="${SPLIT_TYPE}" \
+    TRAIN_SPLIT_FRACTION="${TRAIN_SPLIT_FRACTION}" \
+    LIDAR_INITIALIZATION_FRAMES="${LIDAR_INITIALIZATION_FRAMES}" \
     OUTPUT_DIR="${output_dir}" \
     CONFIG="${CONFIG}" \
     ARMGS_PYTHON="${ARMGS_PYTHON}" \

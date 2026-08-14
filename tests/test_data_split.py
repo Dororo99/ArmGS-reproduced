@@ -13,6 +13,7 @@ from armgs.data.schema import (
     CanonicalFrame,
 )
 from armgs.data.split import (
+    linspace_train_eval_split,
     periodic_train_eval_split,
     split_manifest_by_frame_indices,
 )
@@ -121,6 +122,42 @@ def test_periodic_split_is_capture_atomic_and_builds_embedding_metadata(
     assert lookup(
         torch.tensor([0, 1]), torch.tensor([200, 400], dtype=torch.int64)
     ).tolist() == [0, 3]
+
+
+def test_linspace_split_matches_splatad_50_percent_and_is_capture_atomic(
+    tmp_path: Path,
+) -> None:
+    image = tmp_path / "image.png"
+    image.write_bytes(b"image")
+    manifest = CanonicalDatasetManifest(
+        frames=tuple(
+            _frame(
+                image,
+                frame_index=frame_index,
+                timestamp=100 + frame_index,
+                camera_id=camera_id,
+            )
+            for frame_index in range(8)
+            for camera_id in (0, 1)
+        )
+    )
+
+    split = linspace_train_eval_split(manifest, train_fraction=0.5)
+
+    # np.linspace(0, 7, ceil(8 * 0.5), dtype=int64) == [0, 2, 4, 7].
+    assert {frame.frame_index for frame in split.train_manifest} == {0, 2, 4, 7}
+    assert {frame.frame_index for frame in split.eval_manifest} == {1, 3, 5, 6}
+    assert split.train_source_indices == (0, 1, 4, 5, 8, 9, 14, 15)
+    assert split.eval_source_indices == (2, 3, 6, 7, 10, 11, 12, 13)
+
+
+@pytest.mark.parametrize("fraction", [0.0, 1.0, float("nan"), float("inf")])
+def test_linspace_split_rejects_non_holdout_fractions(
+    tmp_path: Path,
+    fraction: float,
+) -> None:
+    with pytest.raises(ValueError, match="0 < value < 1"):
+        linspace_train_eval_split(_manifest(tmp_path), train_fraction=fraction)
 
 
 def test_split_drops_eval_only_actor_and_held_out_pose_from_training(

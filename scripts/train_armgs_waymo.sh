@@ -6,8 +6,8 @@ usage() {
 Usage: scripts/train_armgs_waymo.sh SEQUENCE START_FRAME END_FRAME [-- TRAINER_ARGS...]
 
 Run one prepared Waymo sequence with the ArmGS paper-oriented defaults:
-  - FRONT 1600x1066, StreetGS every-fourth holdout
-  - all selected frames for LiDAR initialization, first LiDAR return
+  - FRONT 1600x1066, configurable StreetGS-periodic/SplatAD-LINSPACE split
+  - configurable train-only/all-selected LiDAR initialization, first return
   - required train-only known-pose COLMAP points and Grounded-SAM sky masks
   - 30,000 steps in PAPER_MODE=1
   - W&B train GT/render every 500 steps
@@ -31,6 +31,11 @@ Environment overrides:
   COLMAP_POINTS3D  explicit points3D.txt
   OUTPUT_DIR       training output
   CONFIG           ArmGS YAML profile
+  SPLIT_TYPE       streetgs-periodic or linspace (default: streetgs-periodic)
+  TRAIN_SPLIT_FRACTION
+                    fraction for linspace (default: 0.5)
+  LIDAR_INITIALIZATION_FRAMES
+                    all-selected or train-only (default: all-selected)
   ARMGS_PYTHON     training Python (default: /venv/camosplat/bin/python)
   GPU_ID           physical GPU exposed as cuda:0 (optional)
   DEVICE           Torch device when GPU_ID is unset (default: cuda:0)
@@ -95,6 +100,9 @@ COLMAP_DIR="${COLMAP_DIR:-${PREPARED_ROOT}/colmap/${SEQUENCE}}"
 COLMAP_POINTS3D="${COLMAP_POINTS3D:-${COLMAP_DIR}/triangulated_text/points3D.txt}"
 OUTPUT_DIR="${OUTPUT_DIR:-${ARMGS_ROOT}/outputs/waymo/${SEQUENCE}/paper}"
 CONFIG="${CONFIG:-${ARMGS_ROOT}/configs/armgs_waymo_streetgs.yaml}"
+SPLIT_TYPE="${SPLIT_TYPE:-streetgs-periodic}"
+TRAIN_SPLIT_FRACTION="${TRAIN_SPLIT_FRACTION:-0.5}"
+LIDAR_INITIALIZATION_FRAMES="${LIDAR_INITIALIZATION_FRAMES:-all-selected}"
 ARMGS_PYTHON="${ARMGS_PYTHON:-/venv/camosplat/bin/python}"
 PAPER_MODE="${PAPER_MODE:-1}"
 ITERATIONS="${ITERATIONS:-30000}"
@@ -125,6 +133,22 @@ done
 (( ITERATIONS > 0 )) || die "ITERATIONS must be positive"
 (( CHECKPOINT_INTERVAL > 0 )) || die "CHECKPOINT_INTERVAL must be positive"
 (( LOG_INTERVAL > 0 )) || die "LOG_INTERVAL must be positive"
+case "${SPLIT_TYPE}" in
+  streetgs-periodic|linspace) ;;
+  *) die "SPLIT_TYPE must be streetgs-periodic or linspace" ;;
+esac
+awk -v value="${TRAIN_SPLIT_FRACTION}"   'BEGIN { exit !(value ~ /^[0-9]+([.][0-9]+)?$/ && value > 0 && value < 1) }' ||
+  die "TRAIN_SPLIT_FRACTION must satisfy 0 < value < 1"
+case "${LIDAR_INITIALIZATION_FRAMES}" in
+  all-selected|train-only) ;;
+  *) die "LIDAR_INITIALIZATION_FRAMES must be all-selected or train-only" ;;
+esac
+if [[ "${PAPER_MODE}" == "1" ]]; then
+  [[ "${SPLIT_TYPE}" == "streetgs-periodic" ]] ||
+    die "paper mode requires SPLIT_TYPE=streetgs-periodic"
+  [[ "${LIDAR_INITIALIZATION_FRAMES}" == "all-selected" ]] ||
+    die "paper mode requires LIDAR_INITIALIZATION_FRAMES=all-selected"
+fi
 
 if [[ -n "${GPU_ID:-}" ]]; then
   [[ "${GPU_ID}" =~ ^[0-9]+$ ]] || die "GPU_ID must be a non-negative integer"
@@ -225,6 +249,8 @@ TRAIN_ARGS=(
   --sequence "${SEQUENCE}"
   --start-frame "${START_FRAME}"
   --end-frame "${END_FRAME}"
+  --split-type "${SPLIT_TYPE}"
+  --train-split-fraction "${TRAIN_SPLIT_FRACTION}"
   --cache-dir "${CACHE_DIR}"
   --sky-mask-root "${SKY_MASK_ROOT}"
   --colmap-points3d "${COLMAP_POINTS3D}"
@@ -232,7 +258,7 @@ TRAIN_ARGS=(
   --camera FRONT
   --target-height 1066
   --target-width 1600
-  --lidar-initialization-frames all-selected
+  --lidar-initialization-frames "${LIDAR_INITIALIZATION_FRAMES}"
   --lidar-returns first
   --device "${DEVICE}"
   --output-dir "${OUTPUT_DIR}"
@@ -272,7 +298,9 @@ printf 'ArmGS Waymo training preflight passed.\n'
 printf '  sequence: %s (%s frames %s..%s)\n'   "${SEQUENCE}" "${PARQUET_DIR}" "${START_FRAME}" "${END_FRAME}"
 printf '  actor tracking/planar box scale: %s / %s\n' \
   "${CAS_TRACK_PATH}" "${ACTOR_BOX_SCALE}"
-printf '  initialization: all-selected LiDAR return1 + train-only known-pose COLMAP\n'
+printf '  split: %s (train fraction=%s)\n' "${SPLIT_TYPE}" "${TRAIN_SPLIT_FRACTION}"
+printf '  initialization: %s LiDAR return1 + train-only known-pose COLMAP\n' \
+  "${LIDAR_INITIALIZATION_FRAMES}"
 printf '  output: %s\n' "${OUTPUT_DIR}"
 printf '  W&B: %s/%s (%s), image interval=%s\n'   "${WANDB_ENTITY}" "${WANDB_PROJECT}" "${WANDB_MODE}" "${IMAGE_LOG_INTERVAL}"
 printf '  evaluation: periodic=%s, final reconstruction+novel PSNR/SSIM/LPIPS-Alex\n'   "${EVAL_INTERVAL}"

@@ -39,7 +39,10 @@ from armgs.data.schema import (  # noqa: E402
     CanonicalDatasetManifest,
     CanonicalFrame,
 )
-from armgs.data.split import periodic_train_eval_split  # noqa: E402
+from armgs.data.split import (  # noqa: E402
+    linspace_train_eval_split,
+    periodic_train_eval_split,
+)
 import prepare_nuscenes_colmap as _known_pose  # noqa: E402
 
 
@@ -131,11 +134,18 @@ def _positive_float(value: str) -> float:
     return result
 
 
+def _train_split_fraction(value: str) -> float:
+    result = _positive_float(value)
+    if result >= 1.0:
+        raise argparse.ArgumentTypeError("must satisfy 0 < value < 1")
+    return result
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Prepare a StreetGS-style known-pose COLMAP model from the "
-            "paper-protocol training split of one Waymo-v2 sequence."
+            "Prepare a known-pose COLMAP model from the selected StreetGS "
+            "periodic or SplatAD LINSPACE split of one Waymo-v2 sequence."
         )
     )
     parser.add_argument("--waymo-root", type=Path, required=True)
@@ -160,6 +170,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument(
+        "--split-type",
+        choices=("streetgs-periodic", "linspace"),
+        default="streetgs-periodic",
+    )
+    parser.add_argument(
+        "--train-split-fraction",
+        type=_train_split_fraction,
+        default=0.5,
+        help="training fraction for --split-type linspace (default: 0.5)",
+    )
     parser.add_argument("--split-every", type=_positive_int, default=4)
     parser.add_argument("--split-offset", type=_nonnegative_int, default=0)
     parser.add_argument("--split-start-position", type=_nonnegative_int, default=4)
@@ -275,17 +296,27 @@ def _staged_image_name(frame: CanonicalFrame, channel: str) -> str:
 def select_training_frames(
     manifest: CanonicalDatasetManifest,
     *,
+    split_type: str = "streetgs-periodic",
+    train_split_fraction: float = 0.5,
     every: int = 4,
     offset: int = 0,
     start_position: int = 4,
     target_size: tuple[int, int] = (1066, 1600),
 ) -> tuple[Any, tuple[StagedFrame, ...]]:
-    split = periodic_train_eval_split(
-        manifest,
-        every=every,
-        offset=offset,
-        start_position=start_position,
-    )
+    if split_type == "streetgs-periodic":
+        split = periodic_train_eval_split(
+            manifest,
+            every=every,
+            offset=offset,
+            start_position=start_position,
+        )
+    elif split_type == "linspace":
+        split = linspace_train_eval_split(
+            manifest,
+            train_fraction=train_split_fraction,
+        )
+    else:
+        raise ValueError(f"unknown Waymo split type: {split_type!r}")
     selected: list[StagedFrame] = []
     names: set[str] = set()
     for source_index in split.train_source_indices:
@@ -477,6 +508,28 @@ def _frame_mapping(record: StagedFrame) -> dict[str, Any]:
     }
 
 
+def _split_mapping(args: argparse.Namespace, split: Any) -> dict[str, Any]:
+    if args.split_type == "streetgs-periodic":
+        metadata: dict[str, Any] = {
+            "type": "periodic",
+            "every": args.split_every,
+            "offset": args.split_offset,
+            "start_position": args.split_start_position,
+        }
+    elif args.split_type == "linspace":
+        metadata = {
+            "type": "linspace",
+            "train_fraction": args.train_split_fraction,
+            "selection": "numpy.linspace(0,N-1,ceil(N*fraction),dtype=int64)",
+            "per_sensor": True,
+        }
+    else:
+        raise ValueError(f"unknown Waymo split type: {args.split_type!r}")
+    metadata["train_source_indices"] = list(split.train_source_indices)
+    metadata["eval_source_indices"] = list(split.eval_source_indices)
+    return metadata
+
+
 def _mapping_payload(
     *,
     args: argparse.Namespace,
@@ -509,14 +562,7 @@ def _mapping_payload(
             "centering_method": "full_context_mean_vehicle_translation",
             "world_center_m": world_center.detach().cpu().tolist(),
         },
-        "split": {
-            "type": "periodic",
-            "every": args.split_every,
-            "offset": args.split_offset,
-            "start_position": args.split_start_position,
-            "train_source_indices": list(split.train_source_indices),
-            "eval_source_indices": list(split.eval_source_indices),
-        },
+        "split": _split_mapping(args, split),
         "actor_mask": {
             "source": "projected_dynamic_actor_cuboids",
             "tracker_source": (
@@ -569,7 +615,10 @@ def _point_count(points3d_path: Path) -> int:
 def prepare_waymo_colmap(args: argparse.Namespace) -> dict[str, Any]:
     if args.end_frame is not None and args.end_frame < args.start_frame:
         raise ValueError("end_frame must be greater than or equal to start_frame")
-    if args.split_offset >= args.split_every:
+    if (
+        args.split_type == "streetgs-periodic"
+        and args.split_offset >= args.split_every
+    ):
         raise ValueError("split_offset must satisfy 0 <= offset < split_every")
     output_dir = args.output_dir.resolve()
     cache_dir = (
@@ -598,6 +647,8 @@ def prepare_waymo_colmap(args: argparse.Namespace) -> dict[str, Any]:
     )
     split, selected = select_training_frames(
         manifest,
+        split_type=args.split_type,
+        train_split_fraction=args.train_split_fraction,
         every=args.split_every,
         offset=args.split_offset,
         start_position=args.split_start_position,

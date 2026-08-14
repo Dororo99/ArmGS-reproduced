@@ -39,6 +39,7 @@ from .schema import (
 )
 from .split import (
     CanonicalDatasetSplit,
+    linspace_train_eval_split,
     periodic_train_eval_split,
     split_manifest_by_frame_indices,
 )
@@ -77,6 +78,7 @@ __all__ = [
     "load_nuscenes_manifest",
     "load_waymo_world_center",
     "load_waymo_v2_manifest",
+    "linspace_train_eval_split",
     "normalize_nuscenes_scene_name",
     "parse_nuscenes_sky_mask_reject_list",
     "parse_kitti_calibration",

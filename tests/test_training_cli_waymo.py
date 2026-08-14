@@ -217,6 +217,8 @@ def test_parser_paper_defaults_and_guards(tmp_path: Path) -> None:
     assert args.parquet_dir == "validation"
     assert args.start_frame == 0
     assert args.end_frame is None
+    assert args.split_type == "streetgs-periodic"
+    assert args.train_split_fraction == 0.5
     assert args.lidar_returns == "first"
     assert args.camera == "FRONT"
     assert (args.target_height, args.target_width) == (1066, 1600)
@@ -351,6 +353,7 @@ def test_paper_mode_requires_colmap_sky_end_frame_and_30k(tmp_path: Path) -> Non
         )
 
     deviations = (
+        ("split_type", "linspace", "streetgs-periodic"),
         ("lidar_initialization_frames", "train-only", "all-selected"),
         ("lidar_returns", "both", "lidar-returns must be first"),
         ("eval_at_end", False, "eval-at-end"),
@@ -505,6 +508,37 @@ def test_split_is_fixed_to_streetgs_relative_positions_four_eight_and_onward(
         "every": 4,
         "offset": 0,
         "start_position": 4,
+    }
+
+
+def test_split_supports_splatad_linspace_50_percent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+    sentinel = object()
+
+    def fake_split(manifest: Any, **kwargs: Any) -> object:
+        captured["manifest"] = manifest
+        captured.update(kwargs)
+        return sentinel
+
+    monkeypatch.setattr(waymo_training_cli, "linspace_train_eval_split", fake_split)
+    manifest = object()
+
+    assert (
+        waymo_training_cli.split_waymo_manifest(
+            manifest,
+            split_type="linspace",
+            train_split_fraction=0.5,
+        )
+        is sentinel
+    )
+    assert captured == {"manifest": manifest, "train_fraction": 0.5}
+    assert waymo_training_cli.waymo_split_protocol("linspace", 0.5) == {
+        "type": "splatad_linspace",
+        "train_fraction": 0.5,
+        "selection": "numpy.linspace(0,N-1,ceil(N*fraction),dtype=int64)",
+        "per_sensor": True,
     }
 
 
@@ -699,6 +733,67 @@ def test_colmap_mapping_verifies_exact_train_only_split_and_rejects_mismatch(
             sequence="context-001",
             train_source_indices=[0, 1, 2, 3, 5],
             eval_source_indices=[4],
+        )
+
+
+def test_colmap_mapping_verifies_linspace_50_percent_contract(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "colmap"
+    points = output / "triangulated_text" / "points3D.txt"
+    points.parent.mkdir(parents=True)
+    points.write_text("1 0 0 0 255 255 255 0\n", encoding="utf-8")
+    mapping = {
+        "dataset": "waymo_v2",
+        "sequence": "context-001",
+        "status": "complete",
+        "final_points3D_path": str(points.resolve()),
+        "camera_channels": ["FRONT"],
+        "known_pose_contract": {
+            "camera_model": "PINHOLE",
+            "camera_convention": "opencv",
+            "world_frame": "waymo_world_centered",
+            "pose_refinement": False,
+            "intrinsics_refinement": False,
+        },
+        "coordinate_frame": {
+            "name": "waymo_world_centered",
+            "centered": True,
+            "centering_method": "full_context_mean_vehicle_translation",
+            "world_center_m": [0.0, 0.0, 0.0],
+        },
+        "split": {
+            "type": "linspace",
+            "train_fraction": 0.5,
+            "train_source_indices": [0, 2, 5],
+            "eval_source_indices": [1, 3, 4],
+        },
+        "frames": [{"source_index": index} for index in (0, 2, 5)],
+    }
+    mapping_path = output / "mapping.json"
+    mapping_path.write_text(json.dumps(mapping), encoding="utf-8")
+
+    provenance = waymo_training_cli.load_colmap_provenance(
+        points,
+        sequence="context-001",
+        train_source_indices=[0, 2, 5],
+        eval_source_indices=[1, 3, 4],
+        split_protocol=waymo_training_cli.waymo_split_protocol("linspace", 0.5),
+    )
+
+    assert provenance["verified"] is True
+    assert provenance["mapping"] == str(mapping_path.resolve())
+    mapping["split"]["train_fraction"] = 0.75
+    mapping_path.write_text(json.dumps(mapping), encoding="utf-8")
+    with pytest.raises(ValueError, match="train_fraction"):
+        waymo_training_cli.load_colmap_provenance(
+            points,
+            sequence="context-001",
+            train_source_indices=[0, 2, 5],
+            eval_source_indices=[1, 3, 4],
+            split_protocol=waymo_training_cli.waymo_split_protocol(
+                "linspace", 0.5
+            ),
         )
 
 
@@ -1452,3 +1547,31 @@ def test_paper_launcher_requires_nonempty_castrack(tmp_path: Path) -> None:
 
     assert completed.returncode != 0
     assert "requires non-empty CAStrack JSON" in completed.stderr
+
+
+def test_linspace50_batch_wrapper_is_protocol_locked_and_dry_runs() -> None:
+    repository = SCRIPT_PATH.parents[1]
+    launcher = (
+        repository
+        / "scripts"
+        / "train_armgs_waymo_splatad_linspace50_batch.sh"
+    )
+    environment = os.environ.copy()
+    environment.update({"GPU_IDS": "0,1", "WANDB_ENABLED": "0"})
+
+    completed = subprocess.run(
+        ["bash", str(launcher), "--dry-run"],
+        cwd=repository,
+        env=environment,
+        text=True,
+        capture_output=True,
+        timeout=30,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "FRONT, linspace (fraction=0.5)" in completed.stdout
+    assert "LiDAR initialization: train-only" in completed.stdout
+    assert "splatad_linspace50_30k" in completed.stdout
+    assert "SPLIT_TYPE=linspace TRAIN_SPLIT_FRACTION=0.5" in completed.stdout
+    assert "Dry-run complete; no files were read or written." in completed.stdout

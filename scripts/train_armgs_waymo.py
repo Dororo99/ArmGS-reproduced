@@ -46,7 +46,7 @@ from armgs.config import (
     build_sky,
     load_config,
 )
-from armgs.data import periodic_train_eval_split
+from armgs.data import linspace_train_eval_split, periodic_train_eval_split
 from armgs.data.schema import CanonicalDatasetManifest
 from armgs.evaluation import (
     EvaluationAccumulator,
@@ -104,6 +104,8 @@ WAYMO_CAMERA_CHANNELS: tuple[str, ...] = (
 PAPER_SPLIT_EVERY = 4
 PAPER_SPLIT_OFFSET = 0
 PAPER_SPLIT_START_POSITION = 4
+STREETGS_PERIODIC_SPLIT = "streetgs-periodic"
+SPLATAD_LINSPACE_SPLIT = "linspace"
 PAPER_HEIGHT = 1066
 PAPER_WIDTH = 1600
 PAPER_ITERATIONS = 30_000
@@ -150,11 +152,21 @@ def _positive_float(value: str) -> float:
     return parsed
 
 
+def _train_split_fraction(value: str) -> float:
+    try:
+        parsed = float(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("must be a number") from error
+    if not math.isfinite(parsed) or not 0.0 < parsed < 1.0:
+        raise argparse.ArgumentTypeError("must be finite and satisfy 0 < value < 1")
+    return parsed
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Train ArmGS on one Waymo-v2 sequence with the StreetGS every-fourth "
-            "holdout, LiDAR plus optional train-only COLMAP initialization, "
+            "Train ArmGS on one Waymo-v2 sequence with a StreetGS periodic or "
+            "SplatAD LINSPACE split, LiDAR plus train-only COLMAP initialization, "
             "checkpoint-exact resume, held-out metrics, and W&B."
         )
     )
@@ -180,6 +192,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--sequence", required=True, help="Waymo context name")
     parser.add_argument("--start-frame", type=_non_negative_int, default=0)
     parser.add_argument("--end-frame", type=_non_negative_int)
+    parser.add_argument(
+        "--split-type",
+        choices=(STREETGS_PERIODIC_SPLIT, SPLATAD_LINSPACE_SPLIT),
+        default=STREETGS_PERIODIC_SPLIT,
+        help=(
+            "streetgs-periodic holds out positions 4,8,12,...; linspace uses "
+            "the SplatAD per-sensor selection (default: streetgs-periodic)"
+        ),
+    )
+    parser.add_argument(
+        "--train-split-fraction",
+        type=_train_split_fraction,
+        default=0.5,
+        help="training fraction used by --split-type linspace (default: 0.5)",
+    )
     parser.add_argument(
         "--cache-dir",
         type=Path,
@@ -368,6 +395,8 @@ def validate_paper_protocol(
         errors.append("--end-frame is required")
     if args.camera != "FRONT":
         errors.append("--camera must be FRONT")
+    if args.split_type != STREETGS_PERIODIC_SPLIT:
+        errors.append("--split-type must be streetgs-periodic")
     if (args.target_height, args.target_width) != (PAPER_HEIGHT, PAPER_WIDTH):
         errors.append(f"resolution must be {PAPER_WIDTH}x{PAPER_HEIGHT}")
     if args.lidar_initialization_frames != "all-selected":
@@ -520,15 +549,49 @@ def load_waymo_context_center(
     return center.to(device="cpu", dtype=torch.float32)
 
 
-def split_waymo_manifest(manifest: CanonicalDatasetManifest) -> Any:
-    """Apply the immutable StreetGS split: positions 4, 8, 12, ... are test."""
+def waymo_split_protocol(
+    split_type: str,
+    train_split_fraction: float = 0.5,
+) -> dict[str, Any]:
+    if split_type == STREETGS_PERIODIC_SPLIT:
+        return {
+            "type": "streetgs_periodic",
+            "every": PAPER_SPLIT_EVERY,
+            "offset": PAPER_SPLIT_OFFSET,
+            "start_position": PAPER_SPLIT_START_POSITION,
+            "held_out_relative_positions": "4,8,12,...",
+        }
+    if split_type == SPLATAD_LINSPACE_SPLIT:
+        return {
+            "type": "splatad_linspace",
+            "train_fraction": float(train_split_fraction),
+            "selection": "numpy.linspace(0,N-1,ceil(N*fraction),dtype=int64)",
+            "per_sensor": True,
+        }
+    raise ValueError(f"unknown Waymo split type: {split_type!r}")
 
-    return periodic_train_eval_split(
-        manifest,
-        every=PAPER_SPLIT_EVERY,
-        offset=PAPER_SPLIT_OFFSET,
-        start_position=PAPER_SPLIT_START_POSITION,
-    )
+
+def split_waymo_manifest(
+    manifest: CanonicalDatasetManifest,
+    *,
+    split_type: str = STREETGS_PERIODIC_SPLIT,
+    train_split_fraction: float = 0.5,
+) -> Any:
+    """Apply the requested capture-atomic Waymo train/evaluation split."""
+
+    if split_type == STREETGS_PERIODIC_SPLIT:
+        return periodic_train_eval_split(
+            manifest,
+            every=PAPER_SPLIT_EVERY,
+            offset=PAPER_SPLIT_OFFSET,
+            start_position=PAPER_SPLIT_START_POSITION,
+        )
+    if split_type == SPLATAD_LINSPACE_SPLIT:
+        return linspace_train_eval_split(
+            manifest,
+            train_fraction=train_split_fraction,
+        )
+    raise ValueError(f"unknown Waymo split type: {split_type!r}")
 
 
 def lidar_initialization_manifest(
@@ -860,6 +923,7 @@ def load_colmap_provenance(
     sequence: str,
     train_source_indices: Sequence[int],
     eval_source_indices: Sequence[int],
+    split_protocol: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Validate prepare_waymo_colmap's train-only mapping when available."""
 
@@ -920,14 +984,31 @@ def load_colmap_provenance(
     split = payload.get("split")
     if not isinstance(split, Mapping):
         raise ValueError("COLMAP mapping has no split metadata")
-    expected_protocol = {
-        "every": PAPER_SPLIT_EVERY,
-        "offset": PAPER_SPLIT_OFFSET,
-        "start_position": PAPER_SPLIT_START_POSITION,
-    }
-    for key, expected in expected_protocol.items():
-        if int(split.get(key, -1)) != expected:
-            raise ValueError(f"COLMAP mapping has incompatible split {key}")
+    expected_split = (
+        dict(split_protocol)
+        if split_protocol is not None
+        else waymo_split_protocol(STREETGS_PERIODIC_SPLIT)
+    )
+    if expected_split["type"] == "streetgs_periodic":
+        if split.get("type") not in {None, "periodic", "streetgs_periodic"}:
+            raise ValueError("COLMAP mapping has incompatible split type")
+        expected_protocol = {
+            "every": PAPER_SPLIT_EVERY,
+            "offset": PAPER_SPLIT_OFFSET,
+            "start_position": PAPER_SPLIT_START_POSITION,
+        }
+        for key, expected in expected_protocol.items():
+            if int(split.get(key, -1)) != expected:
+                raise ValueError(f"COLMAP mapping has incompatible split {key}")
+    elif expected_split["type"] == "splatad_linspace":
+        if split.get("type") not in {"linspace", "splatad_linspace"}:
+            raise ValueError("COLMAP mapping has incompatible split type")
+        if float(split.get("train_fraction", float("nan"))) != float(
+            expected_split["train_fraction"]
+        ):
+            raise ValueError("COLMAP mapping has incompatible train_fraction")
+    else:
+        raise ValueError("runtime Waymo split protocol is unsupported")
     if list(split.get("train_source_indices", ())) != list(train_source_indices):
         raise ValueError("COLMAP mapping training rows do not match this run")
     if list(split.get("eval_source_indices", ())) != list(eval_source_indices):
@@ -1658,6 +1739,11 @@ def evaluate_waymo_split(
 
 def run(args: argparse.Namespace) -> Path:
     config = _runtime_config(load_config(args.config), args.iterations)
+    if args.split_type == SPLATAD_LINSPACE_SPLIT:
+        config.setdefault("data", {})["split"] = waymo_split_protocol(
+            args.split_type,
+            args.train_split_fraction,
+        )
     validate_paper_protocol(args, config)
     total_iterations = int(config["optimization"]["iterations"])
     device = resolve_device(args.device)
@@ -1727,7 +1813,15 @@ def run(args: argparse.Namespace) -> Path:
         actor_mask_root,
         box_scale=actor_box_scale,
     )
-    split = split_waymo_manifest(manifest)
+    split_protocol = waymo_split_protocol(
+        args.split_type,
+        args.train_split_fraction,
+    )
+    split = split_waymo_manifest(
+        manifest,
+        split_type=args.split_type,
+        train_split_fraction=args.train_split_fraction,
+    )
     enforce_paper_actor_mask_supervision(
         split.train_manifest,
         paper_mode=args.paper_mode,
@@ -1737,6 +1831,7 @@ def run(args: argparse.Namespace) -> Path:
         sequence=args.sequence,
         train_source_indices=split.train_source_indices,
         eval_source_indices=split.eval_source_indices,
+        split_protocol=split_protocol,
     )
     enforce_colmap_provenance(colmap_provenance, paper_mode=args.paper_mode)
     if colmap_points3d is not None and not colmap_provenance["verified"]:
@@ -1992,6 +2087,10 @@ def run(args: argparse.Namespace) -> Path:
         },
     }
     paper_protocol_deviations: list[str] = []
+    if args.split_type != STREETGS_PERIODIC_SPLIT:
+        paper_protocol_deviations.append("split_not_streetgs_periodic")
+    if args.lidar_initialization_frames != "all-selected":
+        paper_protocol_deviations.append("lidar_initialization_not_all_selected")
     if castrack_path is None:
         paper_protocol_deviations.append(
             "tracker_source_waymo_gt_not_streetgs_castrack"
@@ -2050,13 +2149,7 @@ def run(args: argparse.Namespace) -> Path:
         "camera_channels": [args.camera],
         "camera_ids": sorted({frame.camera_id for frame in manifest}),
         "target_resolution": [args.target_height, args.target_width],
-        "split_protocol": {
-            "type": "streetgs_periodic",
-            "every": PAPER_SPLIT_EVERY,
-            "offset": PAPER_SPLIT_OFFSET,
-            "start_position": PAPER_SPLIT_START_POSITION,
-            "held_out_relative_positions": "4,8,12,...",
-        },
+        "split_protocol": split_protocol,
         "train_source_indices": list(split.train_source_indices),
         "eval_source_indices": list(split.eval_source_indices),
         "tracker_source": tracker_source,

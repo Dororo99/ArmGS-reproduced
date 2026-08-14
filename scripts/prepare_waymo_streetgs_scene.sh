@@ -22,6 +22,11 @@ Environment overrides:
   CAS_TRACK_PATH   default: <PREPARED_ROOT>/tracking/castrack/<sequence>.json
   ACTOR_BOX_SCALE  official planar scale from the sequence table
   OUTPUT_DIR       training output
+  SPLIT_TYPE       streetgs-periodic or linspace (default: streetgs-periodic)
+  TRAIN_SPLIT_FRACTION
+                    fraction for linspace (default: 0.5)
+  LIDAR_INITIALIZATION_FRAMES
+                    all-selected or train-only (default: all-selected)
   GPU_ID           physical GPU (default: 0)
   RUN_SKY          1/0 (default: 1)
   RUN_COLMAP       1/0 (default: 1)
@@ -135,6 +140,9 @@ OUTPUT_DIR="${OUTPUT_DIR:-${ARMGS_ROOT}/outputs/waymo/${RUN_TAG}}"
 ARMGS_PYTHON="${ARMGS_PYTHON:-/venv/camosplat/bin/python}"
 GSAM_PYTHON="${GSAM_PYTHON:-/venv/armgs-gsam/bin/python}"
 COLMAP_BINARY="${COLMAP_BINARY:-/usr/bin/colmap}"
+SPLIT_TYPE="${SPLIT_TYPE:-streetgs-periodic}"
+TRAIN_SPLIT_FRACTION="${TRAIN_SPLIT_FRACTION:-0.5}"
+LIDAR_INITIALIZATION_FRAMES="${LIDAR_INITIALIZATION_FRAMES:-all-selected}"
 GPU_ID="${GPU_ID:-0}"
 RUN_SKY="${RUN_SKY:-1}"
 RUN_COLMAP="${RUN_COLMAP:-1}"
@@ -160,6 +168,22 @@ done
   die "ACTOR_BOX_SCALE must be a positive decimal"
 awk -v value="${ACTOR_BOX_SCALE}" 'BEGIN { exit !(value > 0) }' ||
   die "ACTOR_BOX_SCALE must be positive"
+case "${SPLIT_TYPE}" in
+  streetgs-periodic|linspace) ;;
+  *) die "SPLIT_TYPE must be streetgs-periodic or linspace" ;;
+esac
+awk -v value="${TRAIN_SPLIT_FRACTION}"   'BEGIN { exit !(value ~ /^[0-9]+([.][0-9]+)?$/ && value > 0 && value < 1) }' ||
+  die "TRAIN_SPLIT_FRACTION must satisfy 0 < value < 1"
+case "${LIDAR_INITIALIZATION_FRAMES}" in
+  all-selected|train-only) ;;
+  *) die "LIDAR_INITIALIZATION_FRAMES must be all-selected or train-only" ;;
+esac
+if [[ "${PAPER_MODE}" == "1" ]]; then
+  [[ "${SPLIT_TYPE}" == "streetgs-periodic" ]] ||
+    die "paper mode requires SPLIT_TYPE=streetgs-periodic"
+  [[ "${LIDAR_INITIALIZATION_FRAMES}" == "all-selected" ]] ||
+    die "paper mode requires LIDAR_INITIALIZATION_FRAMES=all-selected"
+fi
 
 [[ -x "${ARMGS_PYTHON}" ]] ||
   die "camosplat Python is not executable: ${ARMGS_PYTHON}"
@@ -260,6 +284,8 @@ if [[ "${RUN_COLMAP}" == "1" ]]; then
       --target-width 1600
       --cache-dir "${CACHE_DIR}"
       --output-dir "${COLMAP_DIR}"
+      --split-type "${SPLIT_TYPE}"
+      --train-split-fraction "${TRAIN_SPLIT_FRACTION}"
       --split-every 4
       --split-offset 0
       --split-start-position 4
@@ -286,6 +312,7 @@ if [[ "${RUN_TRAIN}" == "1" ]]; then
   export WAYMO_ROOT PARQUET_DIR PREPARED_ROOT CACHE_DIR SKY_MASK_ROOT
   export COLMAP_DIR COLMAP_POINTS3D OUTPUT_DIR ARMGS_PYTHON GPU_ID
   export CAS_TRACK_PATH ACTOR_BOX_SCALE
+  export SPLIT_TYPE TRAIN_SPLIT_FRACTION LIDAR_INITIALIZATION_FRAMES
   export PAPER_MODE ITERATIONS WANDB_ENABLED WANDB_ENTITY WANDB_PROJECT WANDB_MODE
   export WANDB_RUN_NAME="${WANDB_RUN_NAME:-armgs_waymo_${RUN_TAG}}"
   export IMAGE_LOG_INTERVAL="${IMAGE_LOG_INTERVAL:-500}"

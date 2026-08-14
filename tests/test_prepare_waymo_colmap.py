@@ -140,6 +140,8 @@ def test_parser_defaults_to_paper_front_resolution_split_and_cpu(
 
     assert args.cameras == ("FRONT",)
     assert (args.target_height, args.target_width) == (1066, 1600)
+    assert args.split_type == "streetgs-periodic"
+    assert args.train_split_fraction == 0.5
     assert (args.split_every, args.split_offset, args.split_start_position) == (
         4,
         0,
@@ -182,6 +184,24 @@ def test_selection_holds_out_streetgs_position_four_and_requires_target_size(
             start_position=1,
             target_size=(1066, 1600),
         )
+
+
+def test_selection_matches_splatad_linspace_50_percent(
+    tmp_path: Path,
+) -> None:
+    manifest = _manifest(tmp_path)
+
+    split, selected = waymo_cli.select_training_frames(
+        manifest,
+        split_type="linspace",
+        train_split_fraction=0.5,
+        target_size=(80, 100),
+    )
+
+    # np.linspace(0, 5, ceil(6 * 0.5), dtype=int64) == [0, 2, 5].
+    assert split.train_source_indices == (0, 2, 5)
+    assert split.eval_source_indices == (1, 3, 4)
+    assert [record.frame.frame_index for record in selected] == [0, 2, 5]
 
 
 def test_skip_execution_calls_waymo_loader_stages_train_rgb_and_actor_masks(
@@ -319,6 +339,37 @@ def test_dry_run_leaves_colmap_output_untouched(
     assert payload["summary"]["train_image_count"] == 5
     assert payload["summary"]["eval_image_count"] == 1
     assert not args.output_dir.exists()
+
+
+def test_linspace_dry_run_records_split_contract(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest = _manifest(tmp_path)
+    monkeypatch.setattr(
+        waymo_cli, "_load_waymo_v2_manifest", lambda *args, **kwargs: manifest
+    )
+    args = _args(
+        tmp_path,
+        "--split-type",
+        "linspace",
+        "--train-split-fraction",
+        "0.5",
+        "--dry-run",
+    )
+
+    payload = waymo_cli.prepare_waymo_colmap(args)
+
+    assert payload["split"] == {
+        "type": "linspace",
+        "train_fraction": 0.5,
+        "selection": "numpy.linspace(0,N-1,ceil(N*fraction),dtype=int64)",
+        "per_sensor": True,
+        "train_source_indices": [0, 2, 5],
+        "eval_source_indices": [1, 3, 4],
+    }
+    assert payload["summary"]["train_image_count"] == 3
+    assert payload["summary"]["eval_image_count"] == 3
 
 
 def _make_database(path: Path, selected: tuple[Any, ...]) -> None:
